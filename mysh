@@ -85,6 +85,7 @@ while True:
 
 
 ## 01-05-2021 RJ 0.0.1 Initial version
+## 23-06-2021 RJ 0.0.2 Added to github
 
 with open(__file__) as source_fd:
     VERSION = "?"
