@@ -1,0 +1,2071 @@
+#!/usr/bin/env python3
+
+""" mysqlsh
+
+    Act very much like 'mysql' but enhanced with 'sh' like commands
+
+    alias   - Just like alias
+    a=b     - Set variables
+    cd      - Change database/table/column
+    wc      - Count tables in db, rows in table
+    ps      - show processlist
+    cat     - show content of table (allows 'where')
+    cp      - copy things
+    grep    - show lines that contain any text
+    more    - show content slowly
+    mv      - rename things
+    head    - show first 10 rows of table (allows 'where')
+    rm      - drop
+
+    Also check out useful bits of 'mysql' command...
+
+    Note that all text commands must be first on line and end with ';'
+    ?         (\\?) Synonym for `help'.
+    clear     (\\c) Clear the current input statement.
+    connect   (\\r) Reconnect to the server. Optional arguments are db and host.
+    delimiter (\\d) Set statement delimiter.
+    edit      (\\e) Edit command with $EDITOR.
+    ego       (\\G) Send command to mysql server, display result vertically.
+    exit      (\\q) Exit mysql. Same as quit.
+    go        (\\g) Send command to mysql server.
+    help      (\\h) Display this help.
+    nopager   (\\n) Disable pager, print to stdout.
+    notee     (\\t) Don't write into outfile.
+    pager     (\\P) Set PAGER [to_pager]. Print the query results via PAGER.
+    print     (\\p) Print current command.
+    prompt    (\\R) Change your mysql prompt.
+    quit      (\\q) Quit mysql.
+    rehash    (\\#) Rebuild completion hash.
+    source    (\\.) Execute an SQL script file. Takes a file name as an argument.
+    status    (\\s) Get status information from the server.
+    system    (\\!) Execute a system shell command.
+    tee       (\\T) Set outfile [to_outfile]. Append everything into given outfile.
+    use       (\\u) Use another database. Takes database name as argument.
+    charset   (\\C) Switch to another charset. Might be needed for processing binlog with multi-byte charsets.
+    warnings  (\\W) Show warnings after every statement.
+    nowarning (\\w) Don't show warnings after every statement.
+"""
+
+import argparse
+import atexit
+import contextlib
+from datetime import datetime
+from fnmatch import fnmatch
+import inspect
+import math
+import os
+import re
+import readline
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import traceback
+
+failure = ""
+while True:
+    try:
+        import mo_sql_parsing as sql_parse
+        import mysql.connector
+        import sqlparse
+
+    except ModuleNotFoundError as e:
+        if e.name == failure:
+            print(f"I've tried and I can't install the '{failure}' module - sorry")
+            sys.exit(99)
+        failure = e.name
+        print(f"'{e}' - trying to resolve it...")
+        err = os.system(f"python3 -m pip install {e.name}")
+        if err == 256:
+            name = e.name.replace("_","-")
+            err = os.system(f"python3 -m pip install {name}")
+        continue
+    break
+
+
+## 01-05-2021 RJ 0.0.1 Initial version
+
+with open(__file__) as source_fd:
+    VERSION = "?"
+    for source_line in source_fd:
+        if source_line.startswith("##"):
+            _, DATE, INITS, VERSION, COMMENT = source_line.split(" ", 4)
+            COMMENT = COMMENT.strip()
+        else:
+            if VERSION != "?":
+                break
+
+myname = os.path.basename(sys.argv[0])
+
+g_debug = False
+
+config_file = os.path.join(os.path.expanduser("~"), f"{myname}.cfg")
+hist_file = os.path.join(os.path.expanduser("~"), f".{myname}_history")
+rcfile = os.path.join(os.path.expanduser("~"), f".{myname}rc")
+
+cfg = None
+nothing = object()
+
+level_name = {
+    0: "Database",
+    1: "Table",
+    2: "Column",
+    3: "Row",
+}
+def Fatal(msg):
+    """ Print the message and drop out
+    """
+    print(f"FATAL: {msg}")
+    sys.exit(0)
+
+first_log = time.monotonic()
+last_log = 0
+def Log(*args, **kwargs):
+    """ Write a log to /tmp/snapshot.log
+        If there's a problem, just don't do it
+    """
+    global last_log
+
+    # try:
+    if True:
+        now = time.monotonic()-first_log
+        # stamp = datetime.now().strftime("%d-%m-%Y %H:%M:%S.%f")[:-3]
+        m = math.floor(now/60)
+        s = math.floor(now%60)
+        ms = math.floor(now*1000) % 1000
+        stamp = f"{m:02d}:{s:02d}.{ms:03d}"
+        # if last_log:
+        #     diff = math.floor((now - last_log) * 1000)
+        #     stamp += f" (+{diff:,}ms)"
+        # last_log = now
+
+        if verbose:
+            print(f"{stamp}: ", end="")
+            print(*args, **kwargs)
+
+        with open(f"/tmp/{myname}.log", "a") as fd:
+            fd.write(f"{stamp} {os.getpid()}: ")
+            print(*args, **kwargs, file=fd)
+    # except Exception as e:
+    #     print(e)
+    #     pass
+
+def s(n, plural=None, singular=None):
+    """ Return a word suffix for a number
+        Generally this is "s" unless the number is 1
+        This can be modified if the word isn't pluraliased by adding an 's'
+
+        e.g.    f"{n} warning{s(n)}"
+                f"{n} factor{s(n,'ies','y')}"
+    """
+    if plural is None:
+        plural = "s"
+    if singular is None:
+        singular = ""
+    return singular if n == 1 else plural
+
+_debug_enabled = True
+def Debug(*args, **kwargs):
+    """ Log a debug line with location of call
+
+        Call with True/False to enable (default) or disable output on future calls
+    """
+    global _debug_enabled
+    if len(args) and isinstance(args[0], bool):
+        _debug_enabled = args[0]
+        return
+
+    if not _debug_enabled:
+        return
+
+    line = sys._getframe().f_back.f_lineno
+    frm = inspect.stack()[1]
+    fn = frm.function
+    # mod = inspect.getmodule(frm[0])
+    # name = mod.__name__
+
+    Log(f"DBG: {fn}:{line}", *args, **kwargs)
+
+
+def kmg(size):
+    """ Turn a number of bytes into a human readable form
+    """
+
+    suf = 0
+    while size > 999:
+        size /= 1024
+        suf += 1
+
+    result = f"{size:2.1f}" if size < 9.95 else f"{int(size)}"
+    return result + "BKMGTP"[suf]
+
+def commasplit(string):
+    """ Split on commas but stripping spaces
+    """
+    return [x.strip() for x in string.split(",")]
+
+def render_len(text):
+    """ Returns the rendering width of the text
+        taking into account that it might contain colour codes
+
+        This is NOT efficient!
+    """
+    for n in range(7):
+        sub = f"\033[1;3{n}m"
+        text = text.replace(sub, "")
+    text = text.replace("\033[m", "")
+    return len(text)
+
+def colour(n, text=None):
+    """ return the escape sequence for a given colour number
+        red  green  yellow  blue  magenta  cyan white  reset
+         1     2       3      4      5      6     7      0
+        If 'text' is given, outputs that followed by reset
+    """
+    if text is not None:
+        return colour(n) + text + colour(0)
+
+    if sys.stdout.isatty():
+        if n:
+            return f"\033[1;3{n}m"
+        else:
+            return "\033[m"
+    else:
+        return ""
+
+def esc(text):
+    """ SQL escape the string passed (or simply return a non-string)
+
+        Only escape \, " and \n as we don't want \0, \b, \r or \t
+        Also % and _ generally don't want to be escaped
+        See: https://dev.mysql.com/doc/refman/8.0/en/string-literals.html
+    """
+    if isinstance(text, str):
+        return "\"" + text.replace("\\","\\\\").replace("\"", "\\\"").replace("\n","\\n") + "\""
+    return text
+
+def list_columns(items, width=None):
+    """ Given a list of items that is to be displayed across the page,
+        determine the correct columns widths to show them like 'ls -x' does
+    """
+
+    screen_width = width or shutil.get_terminal_size((80,25))[0]
+
+    # Determine initial maximum number of columns
+    pos = 0
+    for i, item in enumerate(items):
+        w = len(item) + 2
+        if pos + w >= screen_width:
+            columns = i + 1
+            break
+        pos += w
+    else:
+        columns = len(items)
+
+    while True:
+        if columns == 0:
+            return [1]
+        width = []
+        for col in range(columns):
+            width.append(len(items[col]))
+
+        max_pos = screen_width - (columns - 1) * 2
+        col = 0
+        pos = 0
+        for item in items:
+            w = len(item)
+            if w > width[col]:
+                width[col] = w
+            pos += width[col]
+            if pos > max_pos:
+                break
+            col += 1
+            if col == columns:
+                pos = 0
+                col = 0
+        else:
+            if sum(width) < max_pos:
+                return width
+        columns -= 1
+        # if columns == 1:
+        #     return width[:1]
+
+def list_across(names, width=None):
+    """ List the names across the screen like 'ls -x'
+    """
+    widths = list_columns(names, width=width)
+    c = 0
+    for name in names:
+        if c > 0:
+            print("  ", end="")
+        print(name.ljust(widths[c]), end="")
+        c += 1
+        if c == len(widths):
+            c = 0
+            print("")
+    if c:
+        print("")
+
+class Table:
+    columns = None
+    width = 0
+
+    def __init__(self):
+        self.content = []
+
+    def add(self, *args):
+        if not self.content:
+            self.width = len(args)
+            self.columns = [0] * self.width
+            self.just = ["l"] * self.width
+
+        if len(args) != self.width:
+            raise RuntimeError(
+                f"Internal error - added {args}[len {len(args)}] "
+                f"to table headed {self.content[0]}[len {self.width}]"
+            )
+
+        line = []
+        for col, arg in enumerate(args):
+            try:
+                cell = format(arg, ",")
+                self.just[col] = "r"
+            except ValueError:
+                cell = str(arg)
+
+            width = render_len(cell)
+            if width > self.columns[col]:
+                self.columns[col] = width
+
+            line.append(cell)
+        self.content.append(line)
+
+    def render_table(self):
+        result = ""
+        if self.content:
+            def sep_line():
+                nonlocal result
+
+                result += "+"
+                for col in range(self.width):
+                    result += "-" * (width[col] + 2) + "+"
+                result += "\n"
+
+            row = 0
+            width = [0] * self.width
+            for line in self.content:
+                for col in range(self.width):
+                    width[col] = max(width[col], render_len(line[col]))
+
+            sep_line()
+
+            for line in self.content:
+                result += "|"
+                for col in range(self.width):
+                    result += " "
+                    rlen = render_len(line[col])
+                    pad = " " * (self.columns[col] - rlen)
+                    if self.just[col] == "r":
+                        result += pad + line[col]
+                    else:
+                        result += line[col] + pad
+                    result += " |"
+                result += "\n"
+                if row == 0:
+                    sep_line()
+                row += 1
+
+            sep_line()
+            result += f"{row - 1} row{s(row - 1)} in set\n"
+
+        return result
+
+    def render_text(self):
+        result = ""
+        if self.content:
+            row = 0
+            width = self.width - 1
+            for col in self.columns:
+                width += col
+            for line in self.content:
+                for col in range(self.width):
+                    if col:
+                        result += " "
+                    rlen = render_len(line[col])
+                    pad = " " * (self.columns[col] - rlen)
+                    if self.just[col] == "r":
+                        result += pad + line[col]
+                    else:
+                        result += line[col] + pad
+                result += "\n"
+                if row == 0:
+                    result += "-" * width + "\n"
+                row += 1
+        return result
+
+    def print(self):
+        print(self.render_table(), end="")
+
+def config_read(filename=None):
+    """ Read a config file, returning a dict of dict
+    """
+
+    if not filename:
+        filename = config_file
+
+    lineno = 0
+
+    def err(text):
+        raise Belgium(f"Config {filename}:{lineno} [{section}] {text}")
+
+    result = {}
+    section = ""
+    with open(filename) as fd:
+        for line in fd:
+            lineno += 1
+            line = line.strip()
+            if line == "" or line.startswith("#"):
+                continue
+
+            if line.startswith("["):
+                if not line.endswith("]"):
+                    err("missing ']'")
+                section = line[1:-1].lower()
+                if section in result:
+                    err("repeated section")
+                result[section] = {}
+            elif "=" in line:
+                name, value = line.split("=", 1)
+                name = name.rstrip().lower()
+                value = value.lstrip()
+                result[section][name] = value
+            else:
+                err("missing '='")
+
+    return result
+
+def config_write(config, filename=None):
+    """ Non-descructively write config to a file
+
+        Error checking is minimal as it's assumed this file was read using config_read()
+    """
+
+    if not filename:
+        filename = config_file
+
+    try:
+        fd = open(filename, "r+")
+    except PermissionError as e:
+        raise Belgium(f"Cannot write config to {filename}")
+
+    section = ""            # Current section
+    sections = set([""])    # Sections seen
+    names = set()           # Names seen in current section
+
+    def section_end():
+        """ Add anything that's not been found in the current section
+        """
+        nonlocal names
+        nonlocal lines
+
+        for name, value in config.get(section, {}).items():
+            if name not in names:
+                if value is not None:  # We have a new value to add
+                    pos = len(lines)-1
+                    while pos > 0 and lines[pos] == "":
+                        pos -= 1
+                    lines.insert(pos+1, name + " = " + value)
+        names = set()
+
+    config_section = config.get("")
+    lines = []
+    for line in fd:
+        line = line.strip()
+        if not config_section and not line.startswith("["):
+            continue
+
+        if line.startswith("["):
+            section_end()
+            section = line[1:-1].lower()
+            sections.add(section)
+            config_section = config.get(section)
+        elif "=" in line and not line.startswith("#"):
+            name, value = line.split("=", 1)
+            name = name.rstrip().lower()
+            names.add(name)
+            new_value = config_section.get(name)
+            if new_value is not None:
+                line = f"{name} = {new_value}"
+            else:
+                continue
+
+        lines.append(line)
+
+    section_end()
+
+    for section, names in config.items():
+        if section in sections:
+            continue
+        lines.append(f"[{section.lower()}]")
+        for name, value in names.items():
+            lines.append(f"{name} = {value}")
+
+    fd.seek(0)
+    for line in lines:
+        fd.write(line + "\n")
+    fd.truncate()
+    fd.close()
+
+def setting(name, default=nothing):
+    """ Get a setting given the section and name
+        It must be in the config if no default is provided.
+        If a default is provided and used, it's written back to the config file.
+        The 'dirs' section is subtly different in that it canonicalises the result.
+    """
+    section, name = name.lower().split(".", 1)
+    try:
+        result = cfg[section][name]
+    except KeyError:
+        if default is nothing:
+            raise KeyError(f"Missing config in {config_file}: ([{section}] {name})")
+        if default is not None:
+            cfg[section][name] = default
+            try:
+                config_write(cfg)
+            except Exception as e:
+                Fatal("Could not re-write config in {config_file}: {e}")
+        result = default
+
+    if section == "dirs":
+        result = os.path.realpath(os.path.expanduser(result))
+
+    return result
+
+
+class Parser:
+    # p = Parser(self, args)
+    # p.add("-l", "--long", action="store_true")
+    # args = p.parse()
+
+    class ParseError(Exception):
+        pass
+
+    def __init__(self, owner, args):
+        self._owner = owner
+        self._args = args
+        self._parser = argparse.ArgumentParser(
+            prog=owner.command,
+            add_help=False,
+        )
+
+    def add(self, *args, **kwargs):
+        self._parser.add_argument(*args, **kwargs)
+
+    def parse(self):
+        try:
+            return self._parser.parse_args(self._args[1:])
+        except SystemExit as e:
+            raise Parser.ParseError
+
+class ReturnToMainLoop(Exception):
+    pass
+
+
+class Mysqlsh:
+
+    def __init__(self):
+        """ Parse the command line
+        """
+
+        global verbose
+        global debug
+
+        self._cnx = None
+        self._cursor = None
+        self._alias = {}
+        self._var = {}
+
+        self.parser = argparse.ArgumentParser(
+            description=f"{myname.capitalize()} - MySQL Shell",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            add_help=False,
+        )
+        self.parser.add_argument(
+            "-d", "--debug", help=f"Report much of what goes on", action="store_true",
+        )
+        self.parser.add_argument(
+            "-V",
+            "--version",
+            help=f"Report the version ({VERSION}) (with -v for last change)",
+            action="store_true",
+        )
+        self.parser.add_argument(
+            "-v",
+            "--verbose",
+            help="Be chatty about what's happening (repeat to be chattier)",
+            action="count",
+        )
+        self.parser.add_argument("-u", "--user", help="User name for connection")
+        self.parser.add_argument("-p", "--password", help="Password for connection")
+        self.parser.add_argument("-h", "--host", help="Connect to host")
+
+        self.parser.add_argument(
+            "--help",
+            help=f"show help",
+            action="store_true",
+        )
+
+        args = self.parser.parse_args()
+
+        self._user = args.user
+        self._pass = args.password
+        self._host = args.host
+
+        verbose = args.verbose or 0
+        if sys.stdout.isatty():
+            verbose += 1
+
+        debug = args.debug
+        if debug and not verbose:
+            verbose = 1
+
+        if args.help:
+            self.parser.print_help()
+            exit(0)
+
+        if args.version:
+            print(f"{myname} v{VERSION}")
+            if (args.version and args.verbose) or args.verbose > 1:
+                print(f"Modified {DATE} by {INITS} - {COMMENT}")
+            exit(0)
+
+        try:
+            readline.read_history_file(hist_file)
+        except FileNotFoundError:
+            pass
+        except PermissionError:
+            pass
+
+        readline.set_history_length(1000)
+        atexit.register(readline.write_history_file, hist_file)
+
+        self._table = None
+        self._column = None
+
+        self._var["HOME"] = "/" + self.database
+        self.last_cwd = self.cwd
+
+    def help_on(self, command):
+        try:
+            fn = self.__getattribute__("command_" + command.replace("-","_"))
+        except AttributeError:
+            return None
+        if callable(fn):
+            docstring = fn.__doc__.lstrip()
+            if docstring is None:
+                docstring = "No help for '" + command + "' - sorry"
+            # Formatting from PEP 257
+            lines = docstring.expandtabs().splitlines()
+            indent = sys.maxsize
+            for line in lines[1:]:
+                stripped = line.lstrip()
+                if stripped:
+                    indent = min(indent, len(line) - len(stripped))
+            trimmed = [lines[0].strip()]
+            if indent < sys.maxsize:
+                for line in lines[1:]:
+                    trimmed.append(line[indent:].rstrip())
+            while trimmed and not trimmed[-1]:
+                trimmed.pop()
+            while trimmed and not trimmed[0]:
+                trimmed.pop(0)
+
+            return "\n".join(trimmed)
+        else:
+            return f"Unrecognised command ({command})"
+
+    def usage(self, message=None):
+        """ Print a usage message followed by help on the current command
+        """
+        if not message:
+            message = ""
+        print(f"{myname} {self.command}: {message}", file=sys.stderr)
+        print("Usage:", file=sys.stderr)
+        help = self.help_on(self.command)
+        for line in help.split("\n"):
+            print(" ", line, file=sys.stderr)
+        raise ReturnToMainLoop()
+
+    @property
+    def cnx(self):
+        """ Return the global MySQL context
+        """
+        if not self._cnx:
+            user = self._user or setting("mysql.user")
+            password = self._pass or setting("mysql.pass")
+            host = self._host or setting("mysql.host",None) or "localhost"
+
+            try:
+                self._cnx = mysql.connector.connect(
+                    user=user,
+                    password=password,
+                    host=host,
+                    allow_local_infile=True,
+                    buffered=False,
+                )
+            except mysql.connector.Error as err:
+                if err.errno == mysql.connector.errorcode.ER_ACCESS_DENIED_ERROR:
+                    Fatal("Incorrect name or password accessing MySQL - check settings")
+                else:
+                    Fatal(f"{err} accessing MySQL")
+
+            dbname = setting("mysql.database", None)
+            if dbname:
+                self.sql_do(f"use {dbname}")
+
+            print(f"Connected to {self._cnx.get_server_info()} server at {host}")
+        return self._cnx
+
+    def tabdb(self, tablename, dbname=None):
+        """ Return a tuple of a normalised pair of table, database given a bare name and
+            optional dbname.
+            If the table already has a database name component, it'll override any
+            dbname provided so, if g_db is "deepthought":
+
+            tablename,  dbname      Result
+            ---------------------------------------------
+            "fred",     None        ("fred", deepthought")
+            "fred",     "snapshot"  ("fred", "snapshot")
+            "`fred`",   "snapshot"  ("fred", "snapshot")
+            "rog.fred", None        ("fred", "rog")
+            "rog.fred", "snapshot"  ("fred", "rog")
+        """
+        db = dbname.replace("`", "") if dbname else self.database
+        table = tablename.replace("`", "")
+        if "." in table:
+            db, table = table.split(".")
+        return (table, db)
+
+    def qual(self, tablename, dbname=None):
+        """ Return a full qualified table name given a bare name and optional dbname
+            If the table already has a database name component, it'll override any
+            dbname provided so, if g_db is "deepthought":
+
+            tablename,  dbname      Result
+            ---------------------------------------------
+            "fred",     None        `deepthought`.`fred`
+            "fred",     "snapshot"  `snapshot`.`fred`
+            "`fred`",   "snapshot"  `snapshot`.`fred`
+            "rog.fred", None        `rog`.`fred`
+            "rog.fred", "snapshot"  `rog`.`fred`
+        """
+        table, db = self.tabdb(tablename, dbname)
+        return f"`{db}`.`{table}`"
+
+    def tables_in_query(self, query):
+        """ Returns the set of tables involved in the query as
+            a set of tuples (tablename, dbname)
+        """
+
+        p = sqlparse.parse(query)
+        il = sqlparse.sql.IdentifierList(p[0])
+        result = set()
+        want = False
+        for identifier in il.get_identifiers():
+            if identifier.match(sqlparse.tokens.Keyword, ["from","join"]):
+                want = True
+                continue
+            if want:
+                dbname = identifier.get_parent_name()
+                tablename = identifier.get_real_name()
+                result.add(self.tabdb(tablename, dbname))
+                want = False
+
+        return result
+
+    def var_subst(self, text):
+        """ Perform variable substitution in text
+        """
+        matches = re.finditer(r"\$([a-zA-Z]\w*)", text)
+        for match in list(matches)[::-1]:
+            name = match.group(1)
+            if name not in self._var:
+                raise KeyError(f"Variable {name} not known")
+            text = text[:match.start(0)] + self._var[name] + text[match.end(0):]
+        return text
+
+    @property
+    def cwd(self):
+        """ Get the 'cwd' (current database or "" if None)
+        """
+        result = "/"
+        d = self.database
+        t = self.table
+        c = self.column
+        if d:
+            result += d
+            if t:
+                result += "/" + t
+                if c:
+                    result += "/" + c
+
+        return result
+
+    @property
+    def database(self):
+        return self.cnx.database
+
+    @property
+    def table(self):
+        """ Return the current table
+        """
+        return self._table
+
+    @property
+    def column(self):
+        """ Return the current table
+        """
+        return self._column
+
+    @property
+    def level(self):
+        """ Current place level:
+            0   No database selected
+            1   In a database
+            2   In a table
+            3   In a column
+        """
+        if self.column:
+            return 3
+        if self.table:
+            return 2
+        return 0 if self.database is None else 1
+
+    def databases_matching(self, spec):
+        return [
+            x
+            for x in self.sql_all_databases()
+            if fnmatch(x, spec)
+        ]
+
+    def tables_matching(self, dbname, spec):
+        return [
+            x
+            for x in self.sql_all_tables(dbname)
+            if fnmatch(x, spec)
+        ]
+
+    def columns_matching(self, dbname, tablename, spec):
+        return [
+            x
+            for x in self.sql_all_columns(dbname, tablename)
+            if fnmatch(x, spec)
+        ]
+
+    def place(self, spec):
+        """ Return
+                level, [places]
+                Where each place is to the depth given
+        """
+        level = self.level
+        parts = spec.split("/")
+        fred = [self.database, self.table, self.column]
+        result = []
+        for i, part in enumerate(parts):
+            if part == "":
+                if i == 0:
+                    level = 0
+                continue
+            if part == "." * len(part):
+                level -= len(part) - 1
+            else:
+                if level > 2:
+                    raise KeyError("Cannot delve into a column")
+                fred[level] = part
+                level += 1
+
+        # Debug(level, fred)
+        if level > 0:
+            for db in self.databases_matching(fred[0]):
+                if level > 1:
+                    for table in self.tables_matching(db, fred[1]):
+                        if level > 2:
+                            for column in self.columns_matching(db, table, fred[2]):
+                                result.append((db, table, column))
+                        else:
+                            result.append((db, table, None))
+                else:
+                    result.append((db, None, None))
+        else:
+            result.append((None, None, None))
+
+        return level, result
+
+    def multi_place(self, specs):
+        """ As for place() but accepts multiple places that must be the same level
+        """
+        if isinstance(specs, str):
+            specs = [specs]
+        names = []
+        last_level = -1
+        for spec in specs or ".":
+            level, dests = self.place(spec)
+            if last_level != -1 and level != last_level:
+                raise TypeError(f"You cannot mix listing {level_name[last_level]}s and {level_name[level]}s")
+            last_level = level
+            names.extend(dests)
+
+        return level, names
+
+    def rel_place(self, spec, all=False):
+        """ Given our current location (db, table, column)
+            Figure a destination
+
+            Returns a tuple:
+              (level, (dbname, tablename, columnname))
+
+            If 'all' is true then returns:
+              (level, [(db1, table1, column1),(db2, table2, column2)...])
+
+              In all cases:
+              level = 0  dbname = None, tablename = None, columnname = None
+              level = 1  dbname = xyz, tablename = None, columnnam = None
+              level = 2  dbname = xyz, tablename = xyz, columnname = None
+              level = 3  dbname = xyz, tablename = xyz, columnname = xyz
+        """
+        level = self.level
+        db = self.database
+        table = self.table
+        column = self.column
+        parts = spec.split("/")
+        # Debug(f"in: {level}: ({db},{table},{column}) {parts}")
+        for i, part in enumerate(parts):
+            if part == "":
+                if i == 0:
+                    level = 0
+                continue
+            if part == "." * len(part):
+                level -= len(part) - 1
+            else:
+                if level == 0:
+                    if part not in self.sql_all_databases():
+                        raise KeyError(f"Database {part} not found")
+                    db = part
+                    level += 1
+                elif level == 1:
+                    if part not in self.sql_all_tables(db):
+                        raise KeyError(f"Table {part} not found")
+                    table = part
+                    level += 1
+                elif level == 2:
+                    if part not in self.sql_all_columns(db, table):
+                        raise KeyError(f"Column {part} not found")
+                    column = part
+                    level += 1
+                elif level == 3:
+                    raise(f"Cannot delve into a column ({part})")
+
+        if level < 0:
+            level = 0
+        if level < 3:
+            column = None
+        if level < 2:
+            table = None
+        if level < 1:
+            db = None
+        # Debug(f"out: {level}: ({db},{table},{column}) {parts}")
+        if all:
+            return level, [(db, table, column)]
+        return level, (db, table, column)
+
+    @property
+    def cursor(self):
+        # Get ourselves a working cursor
+
+        if self._cursor is None:
+            self._cursor = self.cnx.cursor(buffered=True)
+
+        return self._cursor
+
+    def sql_do(self, command, quietly=False):
+        """ Execute a SQL command, returning a row count
+
+            Returns:
+                row_count   Number of rows affected
+                0           Dry run (or 0 rows affected)
+                -1          Something went awry
+        """
+        command = command.strip()
+
+        cursor = self.cnx.cursor()
+        try:
+            cursor.execute(command)
+            self.cnx.commit()
+            row_count = cursor.rowcount
+        except Exception as e:
+            row_count = -1
+            print(f"Error: {e}")
+        finally:
+            cursor.close()
+        # with self.cnx.cursor() as cursor:
+        #     cursor.execute(command)
+        #     self.cnx.commit()
+        #     row_count = cursor.rowcount
+
+        return row_count
+
+    def sql_get_rows(self, command, new_cursor=False):
+        """ Execute a SQL statement, returning a single row
+            E.g. SELECT value, conceptId, term FROM mytable WHERE id=42
+        """
+        cursor = self.cnx.cursor() if new_cursor else self.cursor
+
+        cursor.execute(command)
+        result = cursor.fetchall()
+        if new_cursor:
+            cursor.close()
+
+        return result
+
+    def sql_get_one_row(self, command, new_cursor=False):
+        """ Execute a SQL statement, returning a single row
+            E.g. SELECT value, conceptId, term FROM mytable WHERE id=42
+        """
+        cursor = self.cnx.cursor() if new_cursor else self.cursor
+
+        cursor.execute(command)
+        result = cursor.fetchone()
+        if new_cursor:
+            cursor.close()
+
+        return result
+
+    def sql_get_value(self, command, new_cursor=False):
+        """ Get a single value from a table
+            E.g. SELECT value FROM mytable WHERE id=42
+        """
+        row = self.sql_get_one_row(command, new_cursor)
+        return row[0] if row else None
+
+    def sql_get_one_column(self, command, new_cursor=False):
+        """ Select a column of values from a table
+            E.g. SELECT term FROM mytable
+            Returns a list of values
+        """
+        cursor = self.cnx.cursor() if new_cursor else self.cursor
+
+        cursor.execute(command)
+        rows = cursor.fetchall()
+        if new_cursor:
+            cursor.close()
+        result = []
+        for row in rows:
+            result.append(row[0])
+
+        return result
+
+    def sql_get(self, query):
+        """ Intelligently get 'something' from MySQL
+            If the query ends 'limit 1' then return
+                Single value if one column
+                list of values if multiple columns
+            Else:
+                list of values of one column
+                list of lists if multiple columns
+
+            Note that 'limit 1' is ok even for 'show tables'
+        """
+
+        cursor = self.cnx.cursor()
+
+        if query.rstrip().lower().endswith("limit 1"):
+            if not query.lstrip().startswith("select "):
+                query = query[:-7]  # Need to strip the limit
+            one = True
+        else:
+            one = False
+
+        try:
+            cursor.execute(query)
+        except Exception as e:
+            Warning(f"Error executing SQL: {e}")
+            Log(query)
+            cursor.close()
+            return None
+
+        rows = cursor.fetchall()
+        if not rows:
+            return None if one else []
+
+        if one:
+            row = rows[0]
+            return row[0] if len(row) == 1 else row
+
+        result = []
+        if len(rows[0]) == 1:
+            for row in rows:
+                result.append(row[0])
+        else:
+            for row in rows:
+                result.append(row)
+
+        return result
+
+    def sql_column_exists(self, columnname, tablename, dbname=None):
+        """ Return True iff the column exists
+        """
+        table, db = self.tabdb(tablename, dbname)
+        return bool(self.columns_matching(db, table, columnname))
+
+    def sql_table_exists(self, tablename, dbname=None):
+        """ Simply return True if the table exists already
+        """
+        table, db = self.tabdb(tablename, dbname)
+
+        row = self.sql_get_value(f"SHOW TABLES IN `{db}` LIKE '{table}'")
+        return bool(row)
+
+    def sql_database_exists(self, dbname):
+        row = self.sql_get_value(f"SHOW DATABASES LIKE '{dbname}'")
+        return bool(row)
+
+    def sql_count(self, tablename, where=None, dbname=None):
+        """ Count entries in a table with optional 'where'
+        """
+
+        table = self.qual(tablename, dbname)
+        query = f"SELECT COUNT(1) FROM {table}"
+        if where:
+            if isinstance(where, str):
+                where = [where]
+            query += " WHERE (" + ") AND (".join(where) + ")"
+        return self.sql_get_value(query)
+
+    def sql_drop_database(self, dbname):
+        """ Drop the database if it exists
+        """
+        if self.sql_database_exists(dbname):
+            self.sql_do(f"DROP DATABASE `{dbname}`")
+
+    def sql_create_database(self, dbname, empty=False):
+        """ Ensure the database exists
+            If empty, ensure it exists empty
+        """
+        if empty:
+            self.sql_drop_database(dbname)
+        if not self.sql_database_exists(dbname):
+            self.sql_do(f"CREATE DATABASE `{dbname}`")
+
+    def sql_index_on(
+        self,
+        tablename,
+        fields,
+        want_unique=False,
+        only_check=False,
+        dbname=None,
+    ):
+        """ Create an index if it doesn't exist
+            tablename   Table to which the index will be applied
+            fields      String (comma sep) or list of fields
+            want_unique Index will be unique
+            only_check  True to only check existance (None if it doesn't exist)
+            dbname      Database
+
+            Won't create an index twice but returns a reference to any matching
+            existing one.  Also, if a unique index exists, but a matching non-unique
+            index is requested, the unique one will be returned.
+        """
+
+        table = self.qual(tablename, dbname)
+        if isinstance(fields, str):
+            fields = fields.split(",")
+        fields = [field.lower() for field in fields]
+        rows = self.sql_get_rows(f"SHOW INDEX FROM {table}")
+        keys = {}
+        ukeys = {}
+        used = {0}
+
+        for row in rows:
+            non_unique = row[1]
+            name = row[2].lower()
+            column = row[4].lower()
+            d = keys if non_unique else ukeys
+            columns = d.get(name)
+            if columns:
+                columns.append(column)
+            else:
+                d[name] = [column]
+
+            if name.startswith("key_") and name[4:].isnumeric():
+                used.add(int(name[4:]))
+            elif name.startswith("ukey_") and name[5:].isnumeric():
+                used.add(int(name[5:]))
+
+        for name, defn in ukeys.items():
+            if (defn == fields):
+                return name
+
+        new_name = None
+        for name, defn in keys.items():
+            if (defn == fields):
+                if not want_unique:
+                    return name
+                self.sql_do(f"ALTER TABLE {table} DROP KEY `{name}`")
+                new_name = name
+                break
+
+        if only_check:
+            return None
+
+        if want_unique:
+            if not new_name:
+                new_name = "ukey_" + str(max(used) + 1)
+            type = "UNIQUE KEY"
+        else:
+            if not new_name:
+                new_name = "key_" + str(max(used) + 1)
+            type = "KEY"
+
+        keys = "`" + "`,`".join(fields) + "`"
+        self.sql_do(f"ALTER TABLE {table} ADD {type} {new_name} ({keys})")
+
+        return new_name
+
+    def sql_all_databases(self):
+        """ Return a set of all databases
+        """
+        return self.sql_get_one_column(f"SHOW DATABASES")
+
+    def sql_all_tables(self, dbname=None):
+        """ Return a set of all tables
+        """
+        db = dbname if dbname else self.database
+        return self.sql_get_one_column(f"SHOW TABLES IN `{db}`")
+
+    def sql_all_columns(self, dbname, tablename):
+        table = self.qual(tablename, dbname)
+        return self.sql_get_one_column(f"DESC {table}")
+
+    def sql_table_fields(self, tablename, dbname=None, underscores=True):
+        """ Return a list of the fields in a table
+        """
+        table = self.qual(tablename, dbname)
+        rows = self.sql_get_rows(f"DESC {table}")
+        columns = [row[0] for row in rows]
+        if not underscores:
+            columns = [col for col in columns if not col.startswith("_")]
+        return columns
+
+    def bulk_insert_init(
+        self,
+        table_name,
+        field_list=None,
+        dbname=None,
+        insert=True,
+        ignore=False,
+        quietly=True,
+    ):
+        """ Returns a structure used to insert bulk entries into a table
+        """
+
+        if not field_list:
+            field_list = self.sql_table_fields(table_name, dbname)
+        field_list_str = "`" + "`,`".join(field_list) + "`"
+        table = self.qual(table_name, dbname)
+        prefix = "INSERT" if insert else "REPLACE"
+        if ignore:
+            prefix += " IGNORE"
+        prefix += f" INTO {table} ({field_list_str}) VALUES "
+
+        return {"prefix": prefix, "ins": "", "quietly":quietly}
+
+    def bulk_insert(self, info, row):
+        """ Adds a row for a bulk insert
+        """
+
+        ins = info["ins"]
+        sep = "," if ins else info["prefix"]
+        row = [
+            self.cnx._cmysql.escape_string(str(x)).decode("UTF8")
+            for x in row
+        ]
+        row_str = "('" + "','".join(row) + "')"
+        ins += sep + row_str
+
+        if len(ins) > 100000:
+            self.sql_do(ins, quietly=info["quietly"])
+            info["ins"] = ""
+        else:
+            info["ins"] = ins
+
+    def bulk_insert_finish(self, info):
+        """ Ends a bulk insert
+        """
+        if info["ins"]:
+            self.sql_do(info["ins"], quietly=info["quietly"])
+        del info
+
+    def command_alias(self, args):
+        line = " ".join(args[1:])
+        if not line or line.isspace():
+            t = Table()
+            t.add("Alias","Expansion")
+            for name, value in sorted(self._alias.items()):
+                t.add(name, value)
+            t.print()
+            return
+        m = re.match(r"(\w+)=(.*)", line)
+        if m:
+            self._alias[m[1]] = m[2]
+        else:
+            raise RuntimeError("Alias error")
+
+    def command_cat(self, args):
+        """ cat TABLE [WHERE]
+
+            Display content of a table
+        """
+        thing = args[1] if len(args) > 1 else "."
+        level, (places) = self.place(thing)
+
+        if len(places) == 0:
+            raise KeyError(f"Not found: {thing}")
+
+        if level < 2:
+            raise KeyError("Cannot cat directories")
+        if level > 2:
+            raise KeyError("Can't cat a column")
+
+        for d, t, c in places:
+            table = self.qual(t, d)
+            self.read_command(f"SELECT * FROM {table}")
+
+    def command_cd(self, args):
+        """ cd [DATABASE|TABLE|COLUMN|-]
+
+            Switch context between databases and tables
+        """
+        place = args[1] if len(args) > 1 else self._var.get("HOME", ".")
+        if place == "-":
+            place = self.last_cwd
+        level, (places) = self.place(place)
+
+        if len(places) == 0:
+            raise KeyError(f"Not found: {place}")
+        d, t, c = places[0]
+        self.last_cwd = self.cwd
+        if level >= 1:
+            self.write_command(f"use {d}")
+        else:
+            tmp = "NONE"
+            self.write_command(f"CREATE DATABASE IF NOT EXISTS {tmp}")
+            self.write_command(f"USE {tmp}")
+            self.write_command(f"DROP DATABASE {tmp}")
+        self._table = t
+        self._column = c
+
+    def command_cp(self, args):
+        """ cp TABLE... DATABASE
+            cp DATABASE|TABLE|COLUMN NAME
+        """
+        p = Parser(self, args)
+        p.add("-f", "--force", action="store_true")
+        p.add("things", help="things to move", nargs="*")
+
+        args = p.parse()
+
+        force = args.force
+        things = args.things
+
+        tup = self.cmd_copymv(things)
+        Debug(tup)
+
+    def command_debug(self, args):
+        """ debug
+
+            Turn internal debug on/off
+        """
+        global g_debug
+
+        g_debug = not g_debug
+        print("Debug mode " + ("enabled" if g_debug else "disabled"))
+
+    def command_head(self, args):
+        """ head TABLE [WHERE]
+
+            Show the first few lines of a table
+        """
+        place = args[1] if len(args) > 1 else "."
+        level, (places) = self.place(place)
+
+        if len(places) == 0:
+            raise KeyError(f"Not found: {place}")
+
+        if level < 2:
+            raise KeyError("Cannot head directories")
+        if level > 2:
+            raise KeyError("Can't head a column")
+
+        for d, t, c in places:
+            table = self.qual(t, d)
+            self.read_command(f"SELECT * FROM {table} LIMIT 10")
+
+    def command_help(self, args):
+        """ help [COMMAND]
+
+            Display general help or help on a specific command
+        """
+        t = Table()
+        t.add("Command","Description")
+        for name in sorted(dir(self)):
+            if name.startswith("command_"):
+                command = name[8:].lower().replace("_","-")
+
+                fn = self.__getattribute__(name)
+                if callable(fn):
+                    doc = fn.__doc__
+                    if doc:
+                        doc = doc.replace("\n\n", "\n").lstrip()
+                        line1 = doc.split("\n", 1)[0]
+                    else:
+                        line1 = "This one is a mystery"
+                    t.add(command, line1)
+
+        t.print()
+
+    def cmd_copymv(self, things):
+        """ Interpret arguments for a cp or mv
+
+            table... database
+            database name
+            table name
+            column name
+            returns 4-tuple:
+                ("tables", {table...}, from_db, to_db)
+                ("rename", level, {place...}, name)
+        """
+        if len(things) < 2:
+            self.usage()
+
+        dest = things.pop()
+
+        sources = set()
+        last_level = None
+        for thing in things:
+            level, places = self.multi_place(thing)
+            if last_level is not None and level != last_level:
+                self.usage("Can only copy/move things of the same type")
+            sources.update(places)
+
+        if not sources:
+            self.usage(f"Can't find {things}")
+
+        if len(sources) > 1:    
+            if level != 2:
+                self.usage(f"Can not copy/move multiple {level_name[level]}s")
+
+            level, place = self.place(dest)
+            if level != 1:
+                self.usage(f"Multiple tables can only be copied or moved to a database (not {level_name[level]})")
+            dest_db = place[0][0]
+            src_db = None
+            tables = set()
+            for source in sources:
+                if source[0] == dest_db:
+                    continue
+                if src_db and source[0] != src_db:
+                    self.usage("All tables must be in the same database")
+                tables.add(source[1])
+                src_db = source[0]
+            return("tables", tables, src_db, dest_db)
+
+        if level == 0:
+            self.usage("Cannot move root")
+        src = places[0]
+        if level == 1:
+            return ("rename", level, src, dest)
+        elif level == 2:
+            level, place = self.place(dest)
+            if level == 1:
+                if place[0][0] == src[0]:  # Src db == dest db
+                    return ("tables", set(), None, None)
+                return ("tables", {src[1]}, src[0], place[0][0])
+            else:
+                return ("rename", level, src, dest)
+        elif level == 3:
+            return ("rename", level, src, dest)
+
+    def command_mv(self, args):
+        """ mv TABLE... DATABASE
+            mv DATABASE|TABLE|COLUMN NAME
+        """
+        p = Parser(self, args)
+        p.add("-f", "--force", action="store_true")
+        p.add("things", help="things to move", nargs="*")
+
+        args = p.parse()
+
+        force = args.force
+        things = args.things
+
+        tup = self.cmd_copymv(things)
+        query2 = None
+        if tup[0] == "tables":  # mv table... db
+            src = tup[2]
+            dst = tup[3]
+            query = (
+                "RENAME TABLE "
+                + ",".join([f"`{src}`.`{t}` TO `{dst}`.`{t}`" for t in tup[1]])
+            )
+        elif tup[1] == 1:       # rename db
+            src = tup[2][0]
+            dst = tup[3]
+            if self.sql_database_exists(dst):
+                if force:
+                    self.sql_do(f"DROP DATABASE `{dst}`")
+                else:
+                    raise KeyError(f"Database {dst} exists (-f to force)")
+            self.sql_do(f"CREATE DATABASE `{dst}`")
+            tables = self.sql_all_tables(src)
+            if tables:
+                query = (
+                    "RENAME TABLE "
+                    + ",".join([f"`{src}`.`{t}` TO `{dst}`.`{t}`" for t in tables])
+                )
+                query2 = f"DROP DATABASE `{src}`"
+            else:
+                query = f"DROP DATABASE `{src}`"
+        elif tup[1] == 2:       # rename table
+            db = tup[2][0]
+            src = tup[2][1]
+            dst = tup[3]
+            query = f"RENAME TABLE `{db}`.`{src}` TO `{db}`.`{dst}`"
+        else:                   # rename column
+            db = tup[2][0]
+            table = tup[2][1]
+            src = tup[2][2]
+            dst = tup[3]
+            if self.sql_column_exists(dst, table, db):
+                if force:
+                    self.sql_do(f"ALTER TABLE `{db}`.`{table}` DROP COLUMN `{dst}`")
+                else:
+                    raise KeyError(f"Column {dst} exists (-f to force)")
+
+            row = self.sql_get_one_row(f"SHOW CREATE TABLE `{db}`.`{table}`")
+            table_defn = row[1].split("\n")
+            for line in table_defn:
+                line = line.lstrip()
+                if line.startswith(f"`{src}` "):
+                    col_defn = f"`{dst}`" + line.rstrip(",")[len(src) + 2:]
+            query = f"ALTER TABLE `{db}`.`{table}` CHANGE COLUMN `{src}` {col_defn}"
+
+        Debug(tup)
+        Debug(query)
+        Debug(query2)
+        err = self.sql_do(query)
+        if err != -1 and query2:
+            self.sql_do(query2)
+        return
+
+    def command_pwd(self, args):
+        print(self.cwd)
+
+    def command_rename_db(self, args):
+        """ rename-db DATABASE NAME
+
+            Renames a database to a new name
+        """
+        source = args[1]
+        dest = args[2]
+        if not self.sql_database_exists(source):
+            raise Belgium("Source db ({source}) doesn't exist")
+        if self.sql_database_exists(dest):
+            raise Belgium("Destination db ({dest}) already exists")
+
+        self.sql_create_database(dest)
+        for table in self.sql_all_data_tables(source):
+            s = self.qual(table, source)
+            d = self.qual(table, dest)
+            self.sql_do(f"RENAME TABLE {s} TO {d}")
+
+    def cmd_list(self, places):
+        """ Returns the level and names for ls, ll etc.
+        """
+        # place = args[1] if len(args) > 1 else "."
+        # level, dests = self.place(place)
+        # level = 0  - all db
+        # level = 1  - all tables in dbs
+        # level = 2  - all columns in dbs, tables
+        # level = 3  - all values in column
+        # Debug(level)
+        # for dest in dests:
+        #     Debug(dest)
+        names = []
+        level, dests = self.multi_place(places)
+        Debug(dests)
+        if level == 0:
+            names = self.sql_all_databases()
+        elif level == 1:
+            for dest in dests:
+                names.extend(self.sql_all_tables(dest[0]))
+        elif level == 2:
+            for dest in dests:
+                names.extend(self.sql_all_columns(dest[0], dest[1]))
+        else:
+            for dest in dests:
+                table = self.qual(dest[1], dest[0])
+                names.extend(self.sql_get_one_column(f"""
+                    SELECT {dest[2]} FROM {table}
+                """))
+
+        return level, sorted(names)
+
+    def cmd_longlist(self, places):
+        """ ll [DATABASE|TABLE...]
+        """
+
+        level, parts = self.multi_place(places)
+        result = Table()
+        for part in parts:
+            dbname, tablename, columnname = part
+            if level == 0:
+                result.add("Tables", "Database")
+                dbs = self.sql_all_databases()
+                for dbname in dbs:
+                    tables = self.sql_all_tables(dbname)
+                    result.add(len(tables), dbname)
+            elif level == 1:
+                result.add("Rows", "Engine", "Date", "Time", f"Table in {dbname}")
+                tables = self.sql_all_tables(dbname)
+                if tables:
+                    in_tables = "IN (" + ",".join(["'"+t+"'" for t in tables]) + ")"
+                    rows = self.sql_get_rows(f"""
+                        SELECT TABLE_ROWS, ENGINE, UPDATE_TIME, TABLE_NAME
+                        FROM INFORMATION_SCHEMA.TABLES
+                        WHERE TABLE_NAME {in_tables} AND TABLE_SCHEMA = "{dbname}"
+                    """)
+                    for row in rows:
+                        count = row[0]
+                        engine = row[1]
+                        date, time = str(row[2]).split() if row[2] else ("", "")
+                        tablename = row[3]
+                        result.add(count, engine, date, time, tablename)
+            elif level == 2:
+                result.add("Definition", "Key", f"Column in {dbname}.{tablename}")
+                table = self.qual(tablename, dbname)
+                rows = self.sql_get(f"DESC {table}")
+                for row in rows:
+                    field = row[0]
+                    defn = row[1].decode()
+                    key = row[3]
+                    result.add(defn, key, field)
+                # columns = self.sql_all_columns(dbname, tablename)
+                # print(f"{len(columns):>6} {dbname}/{tablename}")
+            elif level == 3:
+                Debug(level, part)
+
+        result.print()
+
+    def command_ls(self, args):
+        """ ls [DATABASE|TABLE...]
+        """
+        p = Parser(self, args)
+        p.add("-1", action="store_true")
+        p.add("-l", "--long", action="store_true")
+        p.add("things", help="things to list", nargs="*")
+
+        args = p.parse()
+
+        one = getattr(args, "1")
+        long = args.long
+        things = args.things
+
+        if long:
+            return self.cmd_longlist(things)
+
+        level, names = self.cmd_list(things)
+        if one:
+            t = Table()
+            t.add(level_name[level])
+            for name in names:
+                t.add(name)
+            t.print()
+        else:
+            list_across(names)
+
+    def command_l(self, args):
+        """ l [DATABASE|TABLE...]
+        """
+        _, names = self.cmd_list(args)
+        for name in names:
+            print(name)
+
+    def command_ps(self, args):
+        """ ps [full]
+
+            Display either a 'processlist' or a 'full processlist'
+        """
+
+        p = Parser(self, args)
+        p.add("-l", "--long", action="store_true")
+        args = p.parse()
+
+        long = args.long
+
+        if long:
+            self.read_command("show full processlist")
+        else:
+            self.read_command("show processlist")
+
+    def command_wc(self, args):
+        """ wc DATABASE|TABLE|COLUMN...
+        """
+        place = args[1] or ""
+        level, parts = self.place(place)
+        for part in parts:
+            dbname, tablename, columnname = part
+            if level == 0:
+                Debug(level, part)
+            elif level == 1:
+                tables = self.sql_all_tables(dbname)
+                print(f"{len(tables):>6,} {dbname}")
+            elif level == 2:
+                count = self.sql_count(tablename, dbname=dbname)
+                print(f"{count:>10,} {dbname}/{tablename}")
+                # columns = self.sql_all_columns(dbname, tablename)
+                # print(f"{len(columns):>6} {dbname}/{tablename}")
+            elif level == 3:
+                Debug(level, part)
+
+    def command_test(self, words):
+        """ test DATABASE|TABLE|COLUMN
+        """
+        Log(words)
+        names = ["one","two","three","four","five","six","seven","eight","nine","ten"]
+        n = int(rest)
+        widths = list_columns(names, n)
+        print(widths)
+        print((" " * n) + "|")
+        c = 0
+        for name in names:
+            if c > 0:
+                print("  ", end="")
+            print(name.ljust(widths[c]), end="")
+            c += 1
+            if c == len(widths):
+                c = 0
+                print("")
+        if c:
+            print("")
+
+        return
+        cursor = self.cnx.cursor()
+        print(dir(self.cnx))
+        print(dir(cursor))
+
+    def command_vars(self, words):
+        """ List defined variables
+        """
+        for name, value in sorted(self._var.items()):
+            print(f"{name}={value}")
+
+    def display_result_down(self, cursor):
+        """ Display a result set in 'normal' format
+        """
+        rows = cursor.fetchall()
+
+        num_rows = len(rows)
+        if not num_rows:
+            return num_rows
+
+        num_cols = len(cursor.description)
+        names = [i[0] for i in cursor.description]
+        width = 0
+        for name in names:
+            width = max(width, len(name))
+
+        for count, row in enumerate(rows):
+            print("*" * 27 + " " + str(count+1) + ". row " + "*" * 27)
+            for col, name in enumerate(names):
+                print(name.rjust(width) + ": " + str(row[col]))
+
+        return num_rows
+
+    def display_result_across(self, cursor):
+        """ Display a result set in '\\G' format
+        """
+        rows = cursor.fetchall()
+
+        num_rows = len(rows)
+        if not num_rows:
+            return num_rows
+            
+        num_cols = len(cursor.description)
+        names = [i[0] for i in cursor.description]
+        width = []
+        for name in names:
+            width.append(len(name))
+        for row in rows:
+            for col in range(num_cols):
+                w = len(str(row[col]))
+                if w > width[col]:
+                    width[col] = w
+        just = []
+        for i in range(num_cols):
+            t = cursor.description[i][1]
+            if t in [1, 8]:
+                just.append(str.rjust)
+            else:
+                just.append(str.ljust)
+
+        for col in range(num_cols):
+            print("+" + "-" * (width[col] + 2), end="")
+        print("+")
+        for col in range(num_cols):
+            print(f"| " + names[col].ljust(width[col]+1), end="")
+        print("|")
+        for col in range(num_cols):
+            print("+" + "-" * (width[col] + 2), end="")
+        print("+")
+        for row in rows:
+            for col in range(num_cols):
+                val = row[col]
+                try:
+                    print("| " + val.ljust(width[col]) + " ", end="")
+                except AttributeError:  # no ljust, numeric?
+                    print("| " + str(val).rjust(width[col]) + " ", end="")
+                except TypeError:  # Probably means bytes, not str
+                    print("| " + val.decode().ljust(width[col]) + " ", end="")
+            print("|")
+        for col in range(num_cols):
+            print("+" + "-" * (width[col] + 2), end="")
+        print("+")
+
+        return num_rows
+
+    def read_command(self, line):
+        cursor = self.cursor
+
+        if line.endswith("\\G"):
+            line = line[:-2]
+            down = True
+        else:
+            down = False
+        start = time.time()
+        cursor.execute(line)
+        elapsed = time.time() - start
+
+        if down:
+            count = self.display_result_down(cursor)
+        else:
+            count = self.display_result_across(cursor)
+
+        prefix = f"{count} row{s(count)} in" if count else "Empty"
+        print(f"{prefix} set ({elapsed:0.2f} sec)")
+
+    def write_command(self, line):
+        try:
+            count = self.sql_do(line)
+        except mysql.connector.errors.ProgrammingError as e:
+            print(e)
+
+    def sql(self, word1, line):
+        line = self.var_subst(line)
+        if word1 in "desc describe select show".split():
+            self.read_command(line)
+        else:
+            self.write_command(line)
+
+    def interpret(self, line):
+        if line.lstrip().startswith("!"):
+            os.system(line.lstrip()[1:])
+            return
+
+        expanding = set()
+
+        words = shlex.split(line)
+
+        while True:
+            if not words:
+                return
+            self.command = words[0].lower()
+            if self.command in expanding:
+                break
+
+            alias = self._alias.get(self.command)
+            if not alias:
+                break
+            expanding.add(self.command)
+            words = shlex.split(alias) + words[1:]
+
+        # print(repr(line))
+        # print(repr(words))
+        # print(repr(shlex.join(words)))
+
+        # Var setting
+        while words:
+            m = re.match(r"(\w+)=(.*)", words[0])
+            if not m:
+                break
+            self._var[m.group(1)] = m.group(2)
+            words.pop(0)
+
+        if not words or words[0].startswith("#"):
+            return
+
+        # print(repr(words))
+        proc = "command_" + self.command.replace("-","_")
+        try:
+            fn = self.__getattribute__(proc)
+        except AttributeError:
+            fn = None
+
+        if fn is None:
+            self.sql(self.command, line)
+            return
+
+        for i, word in enumerate(words):
+            words[i] = self.var_subst(word)
+
+        fn(words)
+
+    def table_completion(self, sofar):
+        """ Given some 'sofar' input, offers completions
+        """
+
+        if sofar.startswith("/"):  # Absolute path
+            pass
+
+    class InputCompleter:
+        
+        def __init__(self, owner, comms):
+            self._owner = owner
+            self._comms = sorted(comms)
+            self.starts = {c[0] for c in comms}
+            self._words = []
+            return
+
+        def complete(self, text, state):
+            alltext = readline.get_line_buffer()
+            start = readline.get_begidx()
+            end = readline.get_endidx()
+            line = shlex.split(alltext[:end])
+            if text == "":
+                wordn = len(line)+1
+            else:
+                wordn = len(line)
+            # Log(f"complete({text}, {state}) [{alltext}][{start}:{end}] ({words})")
+            # Log(f"Word {wordn} - [{text}]: ({alltext[:end]}|{alltext[end:]})")
+
+            # print(f"[[state {state}]]")
+            if state == 0:
+                if wordn == 1:
+                    words = self.starts
+                else:
+                    words = set()
+                    # print(">>", self._comms)
+                    for comm in self._comms:
+                        # print(">>>", comm)
+                        # print(f"{comm[0]} ... {line[0]}")
+                        if comm[0] == line[0]:
+                            part = comm[wordn-1]
+                            part = part.replace("...","")
+                            if part.startswith("[") and part.endswith("]"):
+                                part = part[1:-1]
+                            for bit in part.split("|"):
+                                for ch in bit:
+                                    if not ch.isupper():
+                                        words.add(bit)
+                                        break
+                                if bit == "DATABASE":
+                                    words.update(self._owner.sql_all_databases())
+                                elif bit == "TABLE":
+                                    # words.update(self.sql_all_tables)
+                                    words.add("TABLE")
+                                    pass
+                                elif bit == "COLUMN":
+                                    # words.update(self.sql_all_columns)
+                                    words.add("COLUMN")
+                                    pass
+                                else:
+                                    pass
+                self._words = sorted([x for x in words if x.startswith(text)])
+
+            # Return the state'th item from the match list,
+            # if we have that many.
+            try:
+                response = self._words[state]
+            except IndexError:
+                response = None
+            # Log(f"REesponse '{response}'")
+            return response
+
+
+    def run(self):
+
+        # Register our completer function
+
+        comms = []
+        for name in dir(self):
+            if name.startswith("command_"):
+                fn = self.__getattribute__(name)
+                if callable(fn):
+                    for line in (fn.__doc__ or "").split("\n"):
+                        if not line or line.isspace():
+                            break
+                        comms.append(line.split())
+        readline.set_completer(self.InputCompleter(self, comms).complete)
+
+        # Use the tab key for completion
+        readline.parse_and_bind('tab: complete')
+
+        while True:
+            try:
+                line = input(f"{self.cwd}> ")
+            except EOFError:
+                print("")
+                break
+            self.interpret(line)
+
+        cfg["mysql"]["database"] = self.database
+        config_write(cfg)
+
+def main():
+    global cfg
+    global report
+
+    try:
+        cfg = config_read()
+    except Exception as e:
+        cfg = {}
+
+    try:
+        r = Mysqlsh()
+    except Exception as e:
+        Fatal(f"{e} while setting up")
+
+    try:
+        with open(rcfile) as rc:
+            for line in rc:
+                r.interpret(line)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"RC: {e}")
+
+    while True:
+        try:
+            r.run()
+            break
+        except ReturnToMainLoop:
+            continue
+        except Parser.ParseError:
+            pass
+        except Exception as e:
+            print(f"OOPS: {e}")
+            if g_debug:
+                traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
