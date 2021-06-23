@@ -4,17 +4,18 @@
 
     Act very much like 'mysql' but enhanced with 'sh' like commands
 
-    alias   - Just like alias
-    a=b     - Set variables
-    cd      - Change database/table/column
-    wc      - Count tables in db, rows in table
-    ps      - show processlist
-    cat     - show content of table (allows 'where')
+/- y = done subject to test, ? = more to do
+y   alias   - Just like alias
+y   a=b     - Set variables
+y   cd      - Change database/table/column
+y   wc      - Count tables in db, rows in table
+y   ps      - show processlist
+?   cat     - show content of table (allows 'where')
     cp      - copy things
     grep    - show lines that contain any text
     more    - show content slowly
-    mv      - rename things
-    head    - show first 10 rows of table (allows 'where')
+y   mv      - rename things
+?   head    - show first 10 rows of table (allows 'where')
     rm      - drop
     sh      - Switch to shell mode
     sql     - Switch to sql mode
@@ -70,9 +71,9 @@ import traceback
 failure = ""
 while True:
     try:
-        import mo_sql_parsing as sql_parse
         import mysql.connector
-        import sqlparse
+        # Don't currently need sqlparse
+        # import sqlparse
 
     except ModuleNotFoundError as e:
         if e.name == failure:
@@ -87,9 +88,9 @@ while True:
         continue
     break
 
-
 ## 01-05-2021 RJ 0.0.1 Initial version
 ## 23-06-2021 RJ 0.0.2 Added to github
+## 23-06-2021 RJ 0.0.3 Removed reliance on sql parsing modules
 
 with open(__file__) as source_fd:
     VERSION = "?"
@@ -118,6 +119,7 @@ level_name = {
     2: "Column",
     3: "Row",
 }
+
 def Fatal(msg):
     """ Print the message and drop out
     """
@@ -2048,6 +2050,7 @@ def main():
     try:
         r = Mysqlsh()
     except Exception as e:
+        traceback.print_exc()
         Fatal(f"{e} while setting up")
 
     try:
