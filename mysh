@@ -113,6 +113,8 @@ rcfile = os.path.join(os.path.expanduser("~"), f".{myname}rc")
 cfg = None
 nothing = object()
 
+read_only = False
+
 level_name = {
     0: "Database",
     1: "Table",
@@ -1005,6 +1007,11 @@ class Mysqlsh:
         """
         command = command.strip()
 
+        word1 = command.split(None, 1)[0].upper()
+
+        if read_only and word1 != "USE":
+            raise RuntimeError("Read-only mode (disable with rw)")
+
         cursor = self.cnx.cursor()
         try:
             cursor.execute(command)
@@ -1567,9 +1574,9 @@ class Mysqlsh:
                     col_defn = f"`{dst}`" + line.rstrip(",")[len(src) + 2:]
             query = f"ALTER TABLE `{db}`.`{table}` CHANGE COLUMN `{src}` {col_defn}"
 
-        Debug(tup)
-        Debug(query)
-        Debug(query2)
+        # Debug(tup)
+        # Debug(query)
+        # Debug(query2)
         err = self.sql_do(query)
         if err != -1 and query2:
             self.sql_do(query2)
@@ -1725,25 +1732,17 @@ class Mysqlsh:
         else:
             self.read_command("show processlist")
 
-    def command_wc(self, args):
-        """ wc DATABASE|TABLE|COLUMN...
+    def command_ro(self, args):
+        """ Read-only Mode
         """
-        place = args[1] or ""
-        level, parts = self.place(place)
-        for part in parts:
-            dbname, tablename, columnname = part
-            if level == 0:
-                Debug(level, part)
-            elif level == 1:
-                tables = self.sql_all_tables(dbname)
-                print(f"{len(tables):>6,} {dbname}")
-            elif level == 2:
-                count = self.sql_count(tablename, dbname=dbname)
-                print(f"{count:>10,} {dbname}/{tablename}")
-                # columns = self.sql_all_columns(dbname, tablename)
-                # print(f"{len(columns):>6} {dbname}/{tablename}")
-            elif level == 3:
-                Debug(level, part)
+        global read_only
+        read_only = True
+
+    def command_rw(self, args):
+        """ Read-only Mode
+        """
+        global read_only
+        read_only = False
 
     def command_test(self, words):
         """ test DATABASE|TABLE|COLUMN
@@ -1776,6 +1775,26 @@ class Mysqlsh:
         """
         for name, value in sorted(self._var.items()):
             print(f"{name}={value}")
+
+    def command_wc(self, args):
+        """ wc DATABASE|TABLE|COLUMN...
+        """
+        place = args[1] or ""
+        level, parts = self.place(place)
+        for part in parts:
+            dbname, tablename, columnname = part
+            if level == 0:
+                Debug(level, part)
+            elif level == 1:
+                tables = self.sql_all_tables(dbname)
+                print(f"{len(tables):>6,} {dbname}")
+            elif level == 2:
+                count = self.sql_count(tablename, dbname=dbname)
+                print(f"{count:>10,} {dbname}/{tablename}")
+                # columns = self.sql_all_columns(dbname, tablename)
+                # print(f"{len(columns):>6} {dbname}/{tablename}")
+            elif level == 3:
+                Debug(level, part)
 
     def display_result_down(self, cursor):
         """ Display a result set in 'normal' format
@@ -2029,7 +2048,8 @@ class Mysqlsh:
 
         while True:
             try:
-                line = input(f"{self.cwd}> ")
+                col = 2 if read_only else 1
+                line = input(f"{colour(col, self.cwd)}> ")
             except EOFError:
                 print("")
                 break
