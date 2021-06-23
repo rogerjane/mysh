@@ -16,6 +16,10 @@
     mv      - rename things
     head    - show first 10 rows of table (allows 'where')
     rm      - drop
+    sh      - Switch to shell mode
+    sql     - Switch to sql mode
+    ro      - Readonly mode
+    rw      - Readwrite mode
 
     Also check out useful bits of 'mysql' command...
 
