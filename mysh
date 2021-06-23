@@ -209,6 +209,14 @@ def kmg(size):
     result = f"{size:2.1f}" if size < 9.95 else f"{int(size)}"
     return result + "BKMGTP"[suf]
 
+def as_str(text):
+    """ str.decode() if necessary
+    """
+    try:
+        return text.decode()
+    except AttributeError:
+        return text
+
 def commasplit(string):
     """ Split on commas but stripping spaces
     """
@@ -733,7 +741,7 @@ class Mysqlsh:
             if dbname:
                 self.sql_do(f"use {dbname}")
 
-            print(f"Connected to {self._cnx.get_server_info()} server at {host}")
+            print(f"Connected to {self._cnx.get_server_info()} server at {host} as {user}")
         return self._cnx
 
     def tabdb(self, tablename, dbname=None):
@@ -1013,6 +1021,8 @@ class Mysqlsh:
             raise RuntimeError("Read-only mode (disable with rw)")
 
         cursor = self.cnx.cursor()
+        if g_debug:
+            print(f"SQL: {command}")
         try:
             cursor.execute(command)
             self.cnx.commit()
@@ -1022,10 +1032,6 @@ class Mysqlsh:
             print(f"Error: {e}")
         finally:
             cursor.close()
-        # with self.cnx.cursor() as cursor:
-        #     cursor.execute(command)
-        #     self.cnx.commit()
-        #     row_count = cursor.rowcount
 
         return row_count
 
@@ -1144,6 +1150,19 @@ class Mysqlsh:
         row = self.sql_get_value(f"SHOW DATABASES LIKE '{dbname}'")
         return bool(row)
 
+    def sql_column_definition(self, columnname, tablename, dbname):
+        """ Returns a column definition in the form that's used in CREATE TABLE
+
+            Returns None if column doesn't exist
+        """
+        row = self.sql_get_one_row(f"SHOW CREATE TABLE `{dbname}`.`{tablename}`")
+        table_defn = row[1].split("\n")
+        for line in table_defn:
+            line = line.lstrip()
+            if line.startswith(f"`{columnname}` "):
+                return line.rstrip(",")[len(columnname) + 2:]
+        return None
+
     def sql_count(self, tablename, where=None, dbname=None):
         """ Count entries in a table with optional 'where'
         """
@@ -1155,6 +1174,13 @@ class Mysqlsh:
                 where = [where]
             query += " WHERE (" + ") AND (".join(where) + ")"
         return self.sql_get_value(query)
+
+    def sql_drop_table(self, tablename, dbname=None):
+        """ Drop the table if it exists
+        """
+        if self.sql_table_exists(tablename, dbname):
+            table = self.qual(tablename, dbname)
+            self.sql_do(f"DROP TABLE {table}")
 
     def sql_drop_database(self, dbname):
         """ Drop the database if it exists
@@ -1321,6 +1347,10 @@ class Mysqlsh:
         del info
 
     def command_alias(self, args):
+        """ alias [name=command]
+
+            Assign an alias or list all alises
+        """
         line = " ".join(args[1:])
         if not line or line.isspace():
             t = Table()
@@ -1385,15 +1415,82 @@ class Mysqlsh:
         """
         p = Parser(self, args)
         p.add("-f", "--force", action="store_true")
+        p.add("-v", "--verbose", action="store_true")
         p.add("things", help="things to move", nargs="*")
 
         args = p.parse()
 
         force = args.force
+        vebose = args.verbose
         things = args.things
 
         tup = self.cmd_copymv(things)
         Debug(tup)
+        if tup[0] == "rename" and tup[1] == 1:  # Copy db, turn into table copy
+            src_db = tup[2][0]
+            dst_db = tup[3]
+            if not force and self.sql_database_exists(dst_db):
+                raise KeyError(f"Database {dst_db} exists (-f to over-write)")
+            self.sql_drop_database(dst_db)
+            self.sql_create_database(dst_db)
+
+            # Now pretend to be a 'cp table... db' command
+            tup = ("tables", self.sql_all_tables(dbname=src_db), src_db, dst_db)
+
+        if tup[0] == "tables":  # mv table... db
+            tables = tup[1]
+            src_db = tup[2]
+            dst_db = tup[3]
+            if not force:
+                for tablename in tables:
+                    if self.sql_table_exists(tablename, dbname=dst_db):
+                        raise KeyError(f"Table {dst_db}.{tablename} already exists (use -f to force)")
+
+            for tablename in tables:
+                if verbose:
+                    print(f"Copying /{src_db}/{tablename} to /{dst_db}/{tablename}")
+                src_table = self.qual(tablename, src_db)
+                dst_table = self.qual(tablename, dst_db)
+                self.sql_drop_table(dst_table)
+                if self.sql_do(f"CREATE TABLE {dst_table} LIKE {src_table}") == -1:
+                    raise KeyError("Copying stopped - table create failed")
+                if self.sql_do(f"INSERT INTO {dst_table} SELECT * FROM {src_table}") == -1:
+                    raise KeyError("Copying stopped - table copy failed")
+        elif tup[1] == 2:       # copy table
+            db = tup[2][0]
+            src = tup[2][1]
+            dst = tup[3]
+            src_table = self.qual(src, db)
+            dst_table = self.qual(dst, db)
+            if self.sql_table_exists(dst_table):
+                if not force:
+                    raise KeyError(f"Table {db}.{dst} exists (-f to over-write)")
+                self.sql_drop_table(dst_table)
+            if self.sql_do(f"CREATE TABLE {dst_table} LIKE {src_table}") == -1:
+                raise KeyError("Copy aborted - table create failed")
+            if verbose:
+                print(f"Copying /{db}/{src_table} to /{db}/{dst_table}")
+            if self.sql_do(f"INSERT INTO {dst_table} SELECT * FROM {src_table}") == -1:
+                raise KeyError("Table copy failed")
+        else:                   # copy column
+            dbname = tup[2][0]
+            tablename = tup[2][1]
+            src_column = tup[2][2]
+            dst_column = tup[3]
+            table = self.qual(tablename, dbname)
+
+            if self.sql_column_exists(dst_column, tablename, dbname):
+                if force:
+                    self.sql_do(f"ALTER TABLE `{table}` DROP COLUMN `{dst_column}`")
+                else:
+                    raise KeyError(f"Column {dst_column} exists (-f to force)")
+            defn = self.sql_column_definition(src_column, tablename, dbname)
+            if verbose:
+                print(f"Copying {dbname}/{tablename}/{src_column} to {dst_column}")
+            self.sql_do(f"ALTER TABLE {table} ADD COLUMN `{dst_column}` {defn}")
+            self.sql_do(f"UPDATE {table} SET `{dst_column}` = `{src_column}`")
+
+        return
 
     def command_debug(self, args):
         """ debug
@@ -1671,7 +1768,7 @@ class Mysqlsh:
                 rows = self.sql_get(f"DESC {table}")
                 for row in rows:
                     field = row[0]
-                    defn = row[1].decode()
+                    defn = as_str(row[1])
                     key = row[3]
                     result.add(defn, key, field)
                 # columns = self.sql_all_columns(dbname, tablename)
@@ -1739,7 +1836,7 @@ class Mysqlsh:
         read_only = True
 
     def command_rw(self, args):
-        """ Read-only Mode
+        """ Read-write Mode
         """
         global read_only
         read_only = False
@@ -1862,7 +1959,7 @@ class Mysqlsh:
                 except AttributeError:  # no ljust, numeric?
                     print("| " + str(val).rjust(width[col]) + " ", end="")
                 except TypeError:  # Probably means bytes, not str
-                    print("| " + val.decode().ljust(width[col]) + " ", end="")
+                    print("| " + as_str(val).ljust(width[col]) + " ", end="")
             print("|")
         for col in range(num_cols):
             print("+" + "-" * (width[col] + 2), end="")
