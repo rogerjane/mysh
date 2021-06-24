@@ -670,7 +670,7 @@ class Mysqlsh:
         self._table = None
         self._column = None
 
-        self._var["HOME"] = "/" + self.database
+        self._var["HOME"] = "/" + (self.database or "")
         self.last_cwd = self.cwd
 
     def help_on(self, command):
@@ -859,31 +859,33 @@ class Mysqlsh:
             return 2
         return 0 if self.database is None else 1
 
-    def databases_matching(self, spec):
+    def databases_matching(self, spec, must_exist=True):
         return [
             x
             for x in self.sql_all_databases()
             if fnmatch(x, spec)
-        ]
+        ] or ([] if must_exist else [spec])
 
-    def tables_matching(self, dbname, spec):
+    def tables_matching(self, dbname, spec, must_exist=True):
         return [
             x
             for x in self.sql_all_tables(dbname)
             if fnmatch(x, spec)
-        ]
+        ] or ([] if must_exist else [spec])
 
-    def columns_matching(self, dbname, tablename, spec):
+    def columns_matching(self, dbname, tablename, spec, must_exist=True):
         return [
             x
             for x in self.sql_all_columns(dbname, tablename)
             if fnmatch(x, spec)
-        ]
+        ] or ([] if must_exist else [spec])
 
-    def place(self, spec):
+    def place(self, spec, must_exist=True):
         """ Return
                 level, [places]
                 Where each place is to the depth given
+
+            If must_exist, the place is returned even if it doesn't exist
         """
         level = self.level
         parts = spec.split("/")
@@ -904,11 +906,11 @@ class Mysqlsh:
 
         # Debug(level, fred)
         if level > 0:
-            for db in self.databases_matching(fred[0]):
+            for db in self.databases_matching(fred[0], must_exist=must_exist):
                 if level > 1:
-                    for table in self.tables_matching(db, fred[1]):
+                    for table in self.tables_matching(db, fred[1], must_exist=must_exist):
                         if level > 2:
-                            for column in self.columns_matching(db, table, fred[2]):
+                            for column in self.columns_matching(db, table, fred[2], must_exist=must_exist):
                                 result.append((db, table, column))
                         else:
                             result.append((db, table, None))
@@ -1416,19 +1418,21 @@ class Mysqlsh:
         p = Parser(self, args)
         p.add("-f", "--force", action="store_true")
         p.add("-v", "--verbose", action="store_true")
-        p.add("things", help="things to move", nargs="*")
+        p.add("thing", help="things to move", nargs="*")
 
         args = p.parse()
 
         force = args.force
-        vebose = args.verbose
-        things = args.things
+        verbose = args.verbose
+        things = args.thing
 
         tup = self.cmd_copymv(things)
-        Debug(tup)
         if tup[0] == "rename" and tup[1] == 1:  # Copy db, turn into table copy
             src_db = tup[2][0]
-            dst_db = tup[3]
+            level, place = self.place(tup[3], must_exist=False)
+            if level != 1:
+                raise KeyError(f"Database cannot be copied to a {level_name[level]}")
+            dst_db = place[0][0]
             if not force and self.sql_database_exists(dst_db):
                 raise KeyError(f"Database {dst_db} exists (-f to over-write)")
             self.sql_drop_database(dst_db)
@@ -1441,6 +1445,9 @@ class Mysqlsh:
             tables = tup[1]
             src_db = tup[2]
             dst_db = tup[3]
+            # level, dst_db = self.place(tup[3])
+            # if level != 1:
+            #     raise KeyError(f"Tables can only be copied to a database (not {level_name[level]})")
             if not force:
                 for tablename in tables:
                     if self.sql_table_exists(tablename, dbname=dst_db):
@@ -1456,20 +1463,28 @@ class Mysqlsh:
                     raise KeyError("Copying stopped - table create failed")
                 if self.sql_do(f"INSERT INTO {dst_table} SELECT * FROM {src_table}") == -1:
                     raise KeyError("Copying stopped - table copy failed")
-        elif tup[1] == 2:       # copy table
-            db = tup[2][0]
+        elif tup[1] == 2:       # copy table (to table or another db)
+            src_db = dst_db = tup[2][0]
             src = tup[2][1]
-            dst = tup[3]
-            src_table = self.qual(src, db)
-            dst_table = self.qual(dst, db)
+            level, place = self.place(tup[3], must_exist=False)
+            if level == 1:
+                dst_db = place[0][0]
+                dst = src
+            elif level == 2:
+                dst_db = place[0][0]
+                dst = place[0][1]
+            else:
+                raise KeyError(f"Cannot copy a table to a {level_name[level]}")
+            src_table = self.qual(src, src_db)
+            dst_table = self.qual(dst, dst_db)
             if self.sql_table_exists(dst_table):
                 if not force:
-                    raise KeyError(f"Table {db}.{dst} exists (-f to over-write)")
+                    raise KeyError(f"Table /{dst_db}/{dst} exists (-f to over-write)")
                 self.sql_drop_table(dst_table)
             if self.sql_do(f"CREATE TABLE {dst_table} LIKE {src_table}") == -1:
                 raise KeyError("Copy aborted - table create failed")
             if verbose:
-                print(f"Copying /{db}/{src_table} to /{db}/{dst_table}")
+                print(f"Copying /{src_db}/{src} to /{dst_db}/{dst}")
             if self.sql_do(f"INSERT INTO {dst_table} SELECT * FROM {src_table}") == -1:
                 raise KeyError("Table copy failed")
         else:                   # copy column
@@ -1699,6 +1714,45 @@ class Mysqlsh:
             s = self.qual(table, source)
             d = self.qual(table, dest)
             self.sql_do(f"RENAME TABLE {s} TO {d}")
+    def command_rm(self, args):
+        """ rm [DATABASE|TABLE|COLUMN]...
+
+            Removes something
+        """
+        p = Parser(self, args)
+        p.add("-f", "--force", action="store_true")
+        p.add("-r", "--recurse", action="store_true")
+        p.add("thing", help="things to remove", nargs="*")
+
+        args = p.parse()
+
+        force = args.force
+        recurse = args.recurse
+        things = args.thing
+
+        if not force:
+            raise KeyError("-f flag must be specified to delete anything")
+        for thing in things:
+            level, place = self.multi_place(thing)
+            if level == 1:
+                if not recurse:
+                    raise KeyError(f"-r flag must be specified to delete a database (/{place[0][0]})")
+
+        for thing in things:
+            level, places = self.multi_place(thing)
+            for place in places:
+                if level == 1:
+                    self.sql_do(f"DROP DATABASE `{place[0]}`")
+                elif level == 2:
+                    table = self.qual(place[1], place[0])
+                    self.sql_do(f"DROP TABLE {table}")
+                elif level == 3:
+                    table = self.qual(place[1], place[0])
+                    columnname = place[2]
+                    # Debug(f"ALTER TABLE {table} DROP COLUMN `{columnname}`")
+                    self.sql_do(f"ALTER TABLE {table} DROP COLUMN `{columnname}`")
+                else:
+                    raise KeyError(f"Can't delete root")
 
     def cmd_list(self, places):
         """ Returns the level and names for ls, ll etc.
@@ -2146,7 +2200,8 @@ class Mysqlsh:
         while True:
             try:
                 col = 2 if read_only else 1
-                line = input(f"{colour(col, self.cwd)}> ")
+                prompt = f"{colour(col, self.cwd)}> "
+                line = input(prompt)
             except EOFError:
                 print("")
                 break
