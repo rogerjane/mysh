@@ -6,26 +6,25 @@
 
 /- y = done subject to test, ? = more to do
 y   alias   - Just like alias
+y   unalias - remove an alias
 y   a=b     - Set variables
-y   cd      - Change database/table/column
+    cd      - Change database/table/column
 y   wc      - Count tables in db, rows in table
 y   ps      - show processlist
 ?   cat     - show content of table (allows 'where')
-    cp      - copy things
+y   cp      - copy things
     grep    - show lines that contain any text
     more    - show content slowly
 y   mv      - rename things
 ?   head    - show first 10 rows of table (allows 'where')
-    rm      - drop
-    sh      - Switch to shell mode
-    sql     - Switch to sql mode
-    ro      - Readonly mode
-    rw      - Readwrite mode
+y   rm      - drop
+y   ro      - Readonly mode
+y   rw      - Readwrite mode
 
     Also check out useful bits of 'mysql' command...
 
     Note that all text commands must be first on line and end with ';'
-    ?         (\\?) Synonym for `help'.
+y   ?         (\\?) Synonym for `help'.
     clear     (\\c) Clear the current input statement.
     connect   (\\r) Reconnect to the server. Optional arguments are db and host.
     delimiter (\\d) Set statement delimiter.
@@ -33,7 +32,7 @@ y   mv      - rename things
     ego       (\\G) Send command to mysql server, display result vertically.
     exit      (\\q) Exit mysql. Same as quit.
     go        (\\g) Send command to mysql server.
-    help      (\\h) Display this help.
+?   help      (\\h) Display this help.
     nopager   (\\n) Disable pager, print to stdout.
     notee     (\\t) Don't write into outfile.
     pager     (\\P) Set PAGER [to_pager]. Print the query results via PAGER.
@@ -559,6 +558,16 @@ def setting(name, default=nothing):
 
     return result
 
+def update_rc():
+    """ Update the rc file with a setting
+    """
+
+    # Read the rc file into a list
+    # Look for an existing equivalent entry and exchange it
+    # If none, insert into a appropriate place
+
+    # fred="hello"
+    # alias fred=something
 
 class Parser:
     # p = Parser(self, args)
@@ -573,7 +582,7 @@ class Parser:
         self._args = args
         self._parser = argparse.ArgumentParser(
             prog=owner.command,
-            add_help=False,
+            add_help=True,
         )
 
     def add(self, *args, **kwargs):
@@ -831,6 +840,7 @@ class Mysqlsh:
 
     @property
     def database(self):
+        return self.sql_get_value("SELECT DATABASE()")
         return self.cnx.database
 
     @property
@@ -1007,13 +1017,55 @@ class Mysqlsh:
 
         return self._cursor
 
+    def sql_execute(self, query):
+        """ Execute a query with safeguards in case the server has
+            gone away in the meantime etc.
+
+            If the server has to go away and we re-connect.
+        """
+
+        retry = {   # Errors that we should re-try on
+            2002,   # Can't connect to ...
+            2003,   # Can't connect to MySQL server on ...
+            2006,   # Server has gone away
+            2013,   # Server lost
+        }
+
+        try:
+            return self.cursor.execute(query)
+        except mysql.connector.Error as e:
+            if e.errno not in retry:
+                raise
+
+        delay = 1
+        count = 1
+        while count < 10:
+            # del self._cnx
+            self._cnx = None
+            x = self.cnx
+            Log(f"Lost connection - retrying... {count}")
+            try:
+                return self.cursor.execute(query)
+            except mysql.connector.Error as e:
+                if e.errno not in retry:    # It's real this time (odd).
+                    raise
+                if delay > 60:
+                    delay = 60
+                Log(f"Error: {e} - retry in {delay} second{s(delay)}")
+                time.sleep(delay)
+                count += 1
+                delay *= 2
+            except Exception as e:
+                raise
+
     def sql_do(self, command, quietly=False):
         """ Execute a SQL command, returning a row count
 
+            Raises:
+                An exception if the query fails
             Returns:
                 row_count   Number of rows affected
                 0           Dry run (or 0 rows affected)
-                -1          Something went awry
         """
         command = command.strip()
 
@@ -1022,65 +1074,55 @@ class Mysqlsh:
         if read_only and word1 != "USE":
             raise RuntimeError("Read-only mode (disable with rw)")
 
-        cursor = self.cnx.cursor()
         if g_debug:
             print(f"SQL: {command}")
-        try:
-            cursor.execute(command)
-            self.cnx.commit()
-            row_count = cursor.rowcount
-        except Exception as e:
-            row_count = -1
-            print(f"Error: {e}")
-        finally:
-            cursor.close()
+
+        self.sql_execute(command)
+        self.cnx.commit()
+        row_count = self.cursor.rowcount
 
         return row_count
 
-    def sql_get_rows(self, command, new_cursor=False):
+    def sql_query(self, query):
+        """ Execute a SQL query, returning a cursor
+        """
+
+        self.sql_execute(query)
+
+        return self.cursor
+
+    def sql_get_rows(self, command):
         """ Execute a SQL statement, returning a single row
             E.g. SELECT value, conceptId, term FROM mytable WHERE id=42
         """
-        cursor = self.cnx.cursor() if new_cursor else self.cursor
-
-        cursor.execute(command)
+        cursor = self.sql_query(command)
         result = cursor.fetchall()
-        if new_cursor:
-            cursor.close()
 
         return result
 
-    def sql_get_one_row(self, command, new_cursor=False):
+    def sql_get_one_row(self, command):
         """ Execute a SQL statement, returning a single row
             E.g. SELECT value, conceptId, term FROM mytable WHERE id=42
         """
-        cursor = self.cnx.cursor() if new_cursor else self.cursor
-
-        cursor.execute(command)
+        cursor = self.sql_query(command)
         result = cursor.fetchone()
-        if new_cursor:
-            cursor.close()
 
         return result
 
-    def sql_get_value(self, command, new_cursor=False):
+    def sql_get_value(self, command):
         """ Get a single value from a table
             E.g. SELECT value FROM mytable WHERE id=42
         """
-        row = self.sql_get_one_row(command, new_cursor)
+        row = self.sql_get_one_row(command)
         return row[0] if row else None
 
-    def sql_get_one_column(self, command, new_cursor=False):
+    def sql_get_one_column(self, command):
         """ Select a column of values from a table
             E.g. SELECT term FROM mytable
             Returns a list of values
         """
-        cursor = self.cnx.cursor() if new_cursor else self.cursor
-
-        cursor.execute(command)
+        cursor = self.sql_query(command)
         rows = cursor.fetchall()
-        if new_cursor:
-            cursor.close()
         result = []
         for row in rows:
             result.append(row[0])
@@ -1099,8 +1141,6 @@ class Mysqlsh:
             Note that 'limit 1' is ok even for 'show tables'
         """
 
-        cursor = self.cnx.cursor()
-
         if query.rstrip().lower().endswith("limit 1"):
             if not query.lstrip().startswith("select "):
                 query = query[:-7]  # Need to strip the limit
@@ -1109,11 +1149,10 @@ class Mysqlsh:
             one = False
 
         try:
-            cursor.execute(query)
+            cursor = self.sql_query(query)
         except Exception as e:
             Warning(f"Error executing SQL: {e}")
             Log(query)
-            cursor.close()
             return None
 
         rows = cursor.fetchall()
@@ -1522,20 +1561,33 @@ class Mysqlsh:
 
             Show the first few lines of a table
         """
-        place = args[1] if len(args) > 1 else "."
-        level, (places) = self.place(place)
+        p = Parser(self, args)
+        p.add("-n", "--number", type=int, action="store")
+        p.add("table", help="tables to dump", nargs="+", default=".")
 
-        if len(places) == 0:
-            raise KeyError(f"Not found: {place}")
+        args = p.parse()
 
-        if level < 2:
-            raise KeyError("Cannot head directories")
-        if level > 2:
-            raise KeyError("Can't head a column")
+        n = args.number
+        if args.table[0].startswith("-") and args.table[0][1:].isnumeric():
+            if n is None:
+                n = int(args.table.pop(0)[1:])
+        if n is None:
+            n = 10
 
-        for d, t, c in places:
-            table = self.qual(t, d)
-            self.read_command(f"SELECT * FROM {table} LIMIT 10")
+        for table in args.table:
+            level, (places) = self.place(table)
+
+            if len(places) == 0:
+                raise KeyError(f"Not found: {place}")
+
+            if level < 2:
+                raise KeyError("Cannot head directories")
+            if level > 2:
+                raise KeyError("Can't head a column")
+
+            for d, t, c in places:
+                table = self.qual(t, d)
+                self.read_command(f"SELECT * FROM {table} LIMIT {n}")
 
     def command_help(self, args):
         """ help [COMMAND]
@@ -1697,23 +1749,6 @@ class Mysqlsh:
     def command_pwd(self, args):
         print(self.cwd)
 
-    def command_rename_db(self, args):
-        """ rename-db DATABASE NAME
-
-            Renames a database to a new name
-        """
-        source = args[1]
-        dest = args[2]
-        if not self.sql_database_exists(source):
-            raise Belgium("Source db ({source}) doesn't exist")
-        if self.sql_database_exists(dest):
-            raise Belgium("Destination db ({dest}) already exists")
-
-        self.sql_create_database(dest)
-        for table in self.sql_all_data_tables(source):
-            s = self.qual(table, source)
-            d = self.qual(table, dest)
-            self.sql_do(f"RENAME TABLE {s} TO {d}")
     def command_rm(self, args):
         """ rm [DATABASE|TABLE|COLUMN]...
 
@@ -1768,7 +1803,6 @@ class Mysqlsh:
         #     Debug(dest)
         names = []
         level, dests = self.multi_place(places)
-        Debug(dests)
         if level == 0:
             names = self.sql_all_databases()
         elif level == 1:
@@ -1921,6 +1955,18 @@ class Mysqlsh:
         print(dir(self.cnx))
         print(dir(cursor))
 
+    def command_unalias(self, args):
+        """ unalias [NAME]...
+
+            Remove an alias
+        """
+        p = Parser(self, args)
+        p.add("alias", help="aliases to remove", nargs="*")
+        args = p.parse()
+
+        for alias in args.alias:
+            self._alias.pop(alias, None)
+
     def command_vars(self, words):
         """ List defined variables
         """
@@ -2058,6 +2104,9 @@ class Mysqlsh:
         if line.lstrip().startswith("!"):
             os.system(line.lstrip()[1:])
             return
+
+        if line.lstrip().startswith("?"):
+            line = "help " + line[1:]
 
         expanding = set()
 
@@ -2201,6 +2250,7 @@ class Mysqlsh:
             try:
                 col = 2 if read_only else 1
                 prompt = f"{colour(col, self.cwd)}> "
+                prompt = "\001" + colour(col) + "\002" + self.cwd + "\001" + colour(0) + "\002> "
                 line = input(prompt)
             except EOFError:
                 print("")
