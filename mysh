@@ -21,6 +21,29 @@ y   rm      - drop
 y   ro      - Readonly mode
 y   rw      - Readwrite mode
 
+
+    Allow prefixes to change output format, each can be suffixed with '-' to omit the header:
+    table   - Normal form
+    list    - \G format
+    plain   - like table only without all the lines
+    tsv     - Tab sep
+    csv     - CSV
+    xls     - Excel if exported, table otherwise
+
+    csv- SELECT * FROM mytable WHERE x=2 > /tmp/my.csv
+
+    Allow defining default output formats for commands, including aliases:
+
+    format table         - Set default
+    format plain ls      - Plain for ls command
+    format plain l       - pLain for l alias
+    format table ll      - table when using ll alias
+
+    Actual format used is...
+      that specified on the command line
+      or that specified for the command
+      or the default
+
     Also check out useful bits of 'mysql' command...
 
     Note that all text commands must be first on line and end with ';'
