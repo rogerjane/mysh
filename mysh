@@ -113,6 +113,7 @@ while True:
 ## 01-05-2021 RJ 0.0.1 Initial version
 ## 23-06-2021 RJ 0.0.2 Added to github
 ## 23-06-2021 RJ 0.0.3 Removed reliance on sql parsing modules
+## 11-03-2022 RJ 0.0.4 Much revam pof rendering and formats
 
 with open(__file__) as source_fd:
     VERSION = "?"
@@ -137,12 +138,18 @@ nothing = object()
 
 read_only = False
 
+_formats = ["csv", "list", "table", "tsv", "xls"]
+_current_format = "list"
+
 level_name = {
     0: "Database",
     1: "Table",
     2: "Column",
     3: "Row",
 }
+
+class Refusal(Exception):
+    pass
 
 def Fatal(msg):
     """ Print the message and drop out
@@ -231,6 +238,22 @@ def kmg(size):
     result = f"{size:2.1f}" if size < 9.95 else f"{int(size)}"
     return result + "BKMGTP"[suf]
 
+
+def comma_list(items, conj=None):
+    """ Return a comma separated list of the items with a conjunction between
+        the last two.
+
+        E.g. ([1,2,3], "and")   ->  "1, 2 and 3"
+    """
+
+    strs = [str(i) for i in items]
+    if not strs:
+        return ""
+    if len(strs) == 1:
+        return strs[0]
+    return ", ".join(strs[:-1]) + " " + conj + " " + strs[-1] if conj else ", ".join(strs)
+
+
 def as_str(text):
     """ str.decode() if necessary
     """
@@ -239,10 +262,12 @@ def as_str(text):
     except AttributeError:
         return text
 
+
 def commasplit(string):
     """ Split on commas but stripping spaces
     """
     return [x.strip() for x in string.split(",")]
+
 
 def render_len(text):
     """ Returns the rendering width of the text
@@ -345,6 +370,129 @@ def list_across(names, width=None):
             print("")
     if c:
         print("")
+
+def output(text):
+    print(text, end="")
+
+def render_it(header, it, form=None):
+    """ Render the output from an iterator in the required format
+        The format may be passed or default to the 'current' format
+
+        it  Interator that returns a list/tuple on each call.
+            MUST return the same size list/tuple each time.
+
+        form    The format to use:
+            table   - Normal form
+            list    - \G format
+            plain   - like table only without all the lines
+            tsv     - Tab sep
+            csv     - CSV
+            xls     - Excel if exported, table otherwise
+                if the form ends with '-', any header is omitted
+
+        returns number of rows rendered
+    """
+
+    if form is None:
+        form = _current_format
+    if form.endswith("-"):
+        form = form[:-1]
+        header = None
+
+    if form in {"table", "plain"}:
+        rows = list(it)
+        if not header and not rows:
+            return 0
+        columns = len(header) if header else len(row(0))
+        if header:
+            widths = [len(c) for c in header]
+        else:
+            width = [0] * columns
+        formats = [1] * columns
+
+        if form == "table":
+            def sep_line():
+                output("+")
+                for c in range(columns):
+                    output("-" * (widths[c] + 2) + "+")
+                output("\n")
+            lsep = "|"
+            rsep = " |"
+        else:
+            def sep_line():
+                pass
+            lsep = ""
+            rsep = ""
+
+        def show_row(row, formats):
+            output(lsep)
+            for i, value in enumerate(row):
+                v = str(value)
+                w = widths[i]
+                output(" ")
+                output(v.rjust(w) if formats[i] == 1 else v.ljust(w))
+                output(rsep)
+            output("\n")
+
+        for row in rows:
+            for c, value in enumerate(row):
+                value = str(value)
+                if formats[c] == 1 and not value.isnumeric():
+                    formats[c] = -1
+                if len(value) > widths[c]:
+                    widths[c] = len(value)
+
+        if header:
+            sep_line()
+            show_row(header, formats=[-1] * columns)
+        sep_line()
+        for row in rows:
+            show_row(row, formats)
+        sep_line()
+    elif form == "list":
+        rows = list(it)
+        if not rows:
+            return 0
+        columns = len(rows[0])
+        start = 0
+
+        if header:
+            width = max([len(c) for c in header])
+            header_row = [t.rjust(width) + ": " for t in header]
+        else:
+            header_row = [""] * columns
+
+        for i, row in enumerate(it[start:], start=1):
+            output(f"*************************** {i}. row ***************************\n")
+            for c, value in enumerate(row):
+                output(header_row[c])
+                output(value)
+                output("\n")
+    elif form == "tsv":
+        def show(row):
+            output("\t".join(row) + "\n")
+
+        if header:
+            show(header)
+        for row in it:
+            show(row)
+    elif form == "csv":
+        def show(row):
+            for i, c in enumerate(row):
+                q = "," in c or "\"" in c or "\n" in c
+                if i:
+                    output(",")
+                if q:
+                    output("\"" + c.replace("\"","\"\"") + "\"")
+                else:
+                    output(c)
+            output("\n")
+        if header:
+            show(header)
+        for row in it:
+            show(row)
+
+    return len(it)
 
 class Table:
     columns = None
@@ -634,6 +782,10 @@ class Mysqlsh:
         self._cursor = None
         self._alias = {}
         self._var = {}
+        self._format = {}  # Format per command
+        self._default_format = "table"
+
+        # Precedence is <, >, cmd, ""
 
         self.parser = argparse.ArgumentParser(
             description=f"{myname.capitalize()} - MySQL Shell",
@@ -1579,6 +1731,37 @@ class Mysqlsh:
         g_debug = not g_debug
         print("Debug mode " + ("enabled" if g_debug else "disabled"))
 
+    def command_format(self, args):
+        """ format [name=command]
+
+            Set default format or for a specific command
+
+            format          Show default format
+            format list     Set default format to list
+            format ls       Show format for ls command
+            format ls list  Set format for ls command to be 'list'
+        """
+        if len(args) > 3:
+            self.Usage()
+
+        word1 = args[1].lower() if len(args) > 1 else ""
+        word2 = args[2].lower() if len(args) > 2 else ""
+
+        forms = _formats.copy()
+        for x in _formats:
+            forms.append(x + "-")
+        if word2:
+            if word2 not in forms:
+                raise Refusal(f"Second argument must be {comma_list(_formats, 'or')}")
+            self._format[word1] = word2
+        elif word1:
+            if word1 in forms:
+                self._default_format = word1
+            else:
+                print(f"format {word1} {self._format.get(word1, self._default_format)}")
+        else:
+            print(f"format {self._default_format}")
+
     def command_head(self, args):
         """ head TABLE [WHERE]
 
@@ -1588,6 +1771,7 @@ class Mysqlsh:
         p.add("-n", "--number", type=int, action="store")
         p.add("table", help="tables to dump", nargs="+", default=".")
 
+        print(self._format)
         args = p.parse()
 
         n = args.number
@@ -1955,6 +2139,22 @@ class Mysqlsh:
     def command_test(self, words):
         """ test DATABASE|TABLE|COLUMN
         """
+
+        stuff = (
+            ("One","Two","Three","Four"),
+            ("1","2","3","4"),
+            ("111","2\"22","3,33","444"),
+        )
+
+        render_it(stuff[0], stuff[1:])
+        return
+        render_it(stuff[0], stuff[1:], "plain")
+        render_it(stuff[0], stuff[1:], "list")
+        render_it(stuff[0], stuff[1:], "tsv")
+        render_it(stuff[0], stuff[1:], "csv")
+        render_it(stuff[0], stuff[1:], "csv")
+        return
+
         Log(words)
         names = ["one","two","three","four","five","six","seven","eight","nine","ten"]
         n = int(rest)
@@ -2021,74 +2221,18 @@ class Mysqlsh:
         """
         rows = cursor.fetchall()
 
-        num_rows = len(rows)
-        if not num_rows:
-            return num_rows
-
-        num_cols = len(cursor.description)
         names = [i[0] for i in cursor.description]
-        width = 0
-        for name in names:
-            width = max(width, len(name))
-
-        for count, row in enumerate(rows):
-            print("*" * 27 + " " + str(count+1) + ". row " + "*" * 27)
-            for col, name in enumerate(names):
-                print(name.rjust(width) + ": " + str(row[col]))
-
-        return num_rows
+        render_it(names, rows, "list")
+        return len(rows)
 
     def display_result_across(self, cursor):
         """ Display a result set in '\\G' format
         """
         rows = cursor.fetchall()
 
-        num_rows = len(rows)
-        if not num_rows:
-            return num_rows
-            
-        num_cols = len(cursor.description)
         names = [i[0] for i in cursor.description]
-        width = []
-        for name in names:
-            width.append(len(name))
-        for row in rows:
-            for col in range(num_cols):
-                w = len(str(row[col]))
-                if w > width[col]:
-                    width[col] = w
-        just = []
-        for i in range(num_cols):
-            t = cursor.description[i][1]
-            if t in [1, 8]:
-                just.append(str.rjust)
-            else:
-                just.append(str.ljust)
-
-        for col in range(num_cols):
-            print("+" + "-" * (width[col] + 2), end="")
-        print("+")
-        for col in range(num_cols):
-            print(f"| " + names[col].ljust(width[col]+1), end="")
-        print("|")
-        for col in range(num_cols):
-            print("+" + "-" * (width[col] + 2), end="")
-        print("+")
-        for row in rows:
-            for col in range(num_cols):
-                val = row[col]
-                try:
-                    print("| " + val.ljust(width[col]) + " ", end="")
-                except AttributeError:  # no ljust, numeric?
-                    print("| " + str(val).rjust(width[col]) + " ", end="")
-                except TypeError:  # Probably means bytes, not str
-                    print("| " + as_str(val).ljust(width[col]) + " ", end="")
-            print("|")
-        for col in range(num_cols):
-            print("+" + "-" * (width[col] + 2), end="")
-        print("+")
-
-        return num_rows
+        render_it(names, rows, "table")
+        return len(rows)
 
     def read_command(self, line):
         cursor = self.cursor
@@ -2124,6 +2268,8 @@ class Mysqlsh:
             self.write_command(line)
 
     def interpret(self, line):
+        global _current_format
+
         if line.lstrip().startswith("!"):
             os.system(line.lstrip()[1:])
             return
@@ -2135,6 +2281,7 @@ class Mysqlsh:
 
         words = shlex.split(line)
 
+        # First alias substitution
         while True:
             if not words:
                 return
@@ -2148,9 +2295,29 @@ class Mysqlsh:
             expanding.add(self.command)
             words = shlex.split(alias) + words[1:]
 
-        # print(repr(line))
-        # print(repr(words))
-        # print(repr(shlex.join(words)))
+        # See if we have a format prefix:
+        _format_prefix = None
+        _format_suffix = None
+        if words:
+            word1 = words[0]
+            if word1.endswith("-"):
+                word1 = word1[:-1]
+            if word1 in _formats:
+                _format_prefix = words[0]
+                words.pop(0)
+
+        if words:
+            wordn = words[-1]
+            if wordn.endswith(";"):
+                _format_suffix = "table"
+                wordn = wordn[:-1]
+            elif wordn.endswith("\G"):
+                _format_suffix = "list"
+                wordn = wordn[:-2]
+            if wordn == "":
+                words.pop(-1)
+            else:
+                words[-1] = wordn
 
         # Var setting
         while words:
@@ -2163,8 +2330,16 @@ class Mysqlsh:
         if not words or words[0].startswith("#"):
             return
 
-        # print(repr(words))
+        self.command = words[0]
+        _current_format = (
+            self._format.get(self.command.lower()) 
+            or _format_prefix
+            or _format_suffix 
+            or self._default_format
+        )
+        print(repr(words))
         proc = "command_" + self.command.replace("-","_")
+        print(self.command, proc)
         try:
             fn = self.__getattribute__(proc)
         except AttributeError:
