@@ -22,27 +22,27 @@ y   ro      - Readonly mode
 y   rw      - Readwrite mode
 
 
-    Allow prefixes to change output format, each can be suffixed with '-' to omit the header:
-    table   - Normal form
-    list    - \G format
-    plain   - like table only without all the lines
-    tsv     - Tab sep
-    csv     - CSV
+y   Allow prefixes to change output format, each can be suffixed with '-' to omit the header:
+y   table   - Normal form
+y   list    - \G format
+y   plain   - like table only without all the lines
+y   tsv     - Tab sep
+y   csv     - CSV
     xls     - Excel if exported, table otherwise
 
     csv- SELECT * FROM mytable WHERE x=2 > /tmp/my.csv
 
-    Allow defining default output formats for commands, including aliases:
+y   Allow defining default output formats for commands, including aliases:
 
-    format table         - Set default
-    format plain ls      - Plain for ls command
-    format plain l       - pLain for l alias
-    format table ll      - table when using ll alias
+y   format table         - Set default
+y   format plain ls      - Plain for ls command
+y   format plain l       - pLain for l alias
+y   format table ll      - table when using ll alias
 
-    Actual format used is...
-      that specified on the command line
-      or that specified for the command
-      or the default
+y   Actual format used is...
+y     that specified on the command line
+y     or that specified for the command
+y     or the default
 
     Also check out useful bits of 'mysql' command...
 
@@ -56,9 +56,9 @@ y   ?         (\\?) Synonym for `help'.
     exit      (\\q) Exit mysql. Same as quit.
     go        (\\g) Send command to mysql server.
 ?   help      (\\h) Display this help.
-    nopager   (\\n) Disable pager, print to stdout.
+y   nopager   (\\n) Disable pager, print to stdout.
     notee     (\\t) Don't write into outfile.
-    pager     (\\P) Set PAGER [to_pager]. Print the query results via PAGER.
+y   pager     (\\P) Set PAGER [to_pager]. Print the query results via PAGER.
     print     (\\p) Print current command.
     prompt    (\\R) Change your mysql prompt.
     quit      (\\q) Quit mysql.
@@ -67,7 +67,7 @@ y   ?         (\\?) Synonym for `help'.
     status    (\\s) Get status information from the server.
     system    (\\!) Execute a system shell command.
     tee       (\\T) Set outfile [to_outfile]. Append everything into given outfile.
-    use       (\\u) Use another database. Takes database name as argument.
+y   use       (\\u) Use another database. Takes database name as argument.
     charset   (\\C) Switch to another charset. Might be needed for processing binlog with multi-byte charsets.
     warnings  (\\W) Show warnings after every statement.
     nowarning (\\w) Don't show warnings after every statement.
@@ -85,7 +85,7 @@ import re
 import readline
 import shlex
 import shutil
-import subprocess
+from subprocess import Popen, PIPE
 import sys
 import time
 import traceback
@@ -137,8 +137,11 @@ cfg = None
 nothing = object()
 
 read_only = False
+verbose = 1
 
-_formats = ["csv", "list", "table", "tsv", "xls"]
+_pager = None
+
+_formats = ["csv", "list", "plain", "table", "tsv", "xls"]
 _current_format = "list"
 
 level_name = {
@@ -371,10 +374,43 @@ def list_across(names, width=None):
     if c:
         print("")
 
+def set_pager(pager):
+    """ Set the current pager, returning the previous
+    """
+    global _pager
+
+    result = _pager
+    _pager = pager
+    return result
+
+def get_pager():
+    """ Return the current pager
+    """
+    return _pager
+
 def output(text):
+    """ Generic output for render_it()
+    """
     print(text, end="")
 
-def render_it(header, it, form=None):
+def render_it(*args, **kwargs):
+    p = get_pager()
+    if not p:
+        return render_it_plain(*args, **kwargs)
+
+    try:
+        fd = os.popen(p, "w")
+    except Exception as e:
+        print("Can't open pager ", e)
+        return 0
+    
+    with contextlib.redirect_stdout(fd):
+        result = render_it_plain(*args, **kwargs)
+    fd.close()
+
+    return result
+
+def render_it_plain(header, it, form=None):
     """ Render the output from an iterator in the required format
         The format may be passed or default to the 'current' format
 
@@ -403,11 +439,11 @@ def render_it(header, it, form=None):
         rows = list(it)
         if not header and not rows:
             return 0
-        columns = len(header) if header else len(row(0))
+        columns = len(header) if header else len(rows[0])
         if header:
             widths = [len(c) for c in header]
         else:
-            width = [0] * columns
+            widths = [0] * columns
         formats = [1] * columns
 
         if form == "table":
@@ -416,7 +452,7 @@ def render_it(header, it, form=None):
                 for c in range(columns):
                     output("-" * (widths[c] + 2) + "+")
                 output("\n")
-            lsep = "|"
+            lsep = "| "
             rsep = " |"
         else:
             def sep_line():
@@ -429,7 +465,8 @@ def render_it(header, it, form=None):
             for i, value in enumerate(row):
                 v = str(value)
                 w = widths[i]
-                output(" ")
+                if i:
+                    output(" ")
                 output(v.rjust(w) if formats[i] == 1 else v.ljust(w))
                 output(rsep)
             output("\n")
@@ -470,7 +507,7 @@ def render_it(header, it, form=None):
                 output("\n")
     elif form == "tsv":
         def show(row):
-            output("\t".join(row) + "\n")
+            output("\t".join([str(r) for r in row]) + "\n")
 
         if header:
             show(header)
@@ -479,6 +516,7 @@ def render_it(header, it, form=None):
     elif form == "csv":
         def show(row):
             for i, c in enumerate(row):
+                c = str(c)
                 q = "," in c or "\"" in c or "\n" in c
                 if i:
                     output(",")
@@ -494,9 +532,11 @@ def render_it(header, it, form=None):
 
     return len(it)
 
-class Table:
+class xTable:
     columns = None
     width = 0
+
+    _renderer = None
 
     def __init__(self):
         self.content = []
@@ -527,6 +567,12 @@ class Table:
 
             line.append(cell)
         self.content.append(line)
+
+
+    @classmethod
+    def set_renderer(cls, renderer):
+        cls._renderer = renderer
+        Debug(cls._renderer)
 
     def render_table(self):
         result = ""
@@ -592,7 +638,38 @@ class Table:
         return result
 
     def print(self):
+        if self._renderer:
+            fn = self._renderer.__func__
+            Debug(fn)
+            return fn(self.content[0], self.content[1:])
+
         print(self.render_table(), end="")
+
+class Table:
+    """ Simple class to handle a simple table of values.
+
+        Simple because it hands the rendering off to render_it()
+    """
+    def __init__(self):
+        self._rows = []
+        self._width = None
+
+    def add(self, *args):
+        width = len(args)
+
+        if self._width is None:
+            self._width = width
+        else:
+            if self._width != len(args):
+                raise RuntimeError(
+                    f"Internal error - added {args}[len {width}] "
+                    f"to table headed {self._rows[0]}[len {self._width}]"
+                )
+            
+        self._rows.append(args)
+
+    def print(self):
+        return render_it(self._rows[0], self._rows[1:])
 
 def config_read(filename=None):
     """ Read a config file, returning a dict of dict
@@ -1581,11 +1658,11 @@ class Mysqlsh:
         else:
             raise RuntimeError("Alias error")
 
-    def command_cat(self, args):
-        """ cat TABLE [WHERE]
-
-            Display content of a table
+    def cmd_catmore(self, args):
+        """ more TABLE [WHERE]
+            cat TABLE [WHERE]
         """
+        cm = args[0]
         thing = args[1] if len(args) > 1 else "."
         level, (places) = self.place(thing)
 
@@ -1593,13 +1670,32 @@ class Mysqlsh:
             raise KeyError(f"Not found: {thing}")
 
         if level < 2:
-            raise KeyError("Cannot cat directories")
+            raise KeyError(f"Cannot {cm} directories")
         if level > 2:
-            raise KeyError("Can't cat a column")
+            raise KeyError(f"Can't {cm} a column")
 
-        for d, t, c in places:
-            table = self.qual(t, d)
-            self.read_command(f"SELECT * FROM {table}")
+        old_pager = set_pager("more" if cm == "more" else None)
+        try:
+            for d, t, c in places:
+                table = self.qual(t, d)
+                self.read_command(f"SELECT * FROM {table}")
+        finally:
+            set_pager(old_pager)
+
+
+    def command_cat(self, args):
+        """ cat TABLE [WHERE]
+
+            Display content of a table
+        """
+        return self.cmd_catmore(args)
+
+    def command_more(self, args):
+        """ more TABLE [WHERE]
+
+            Display content of a table
+        """
+        return self.cmd_catmore(args)
 
     def command_cd(self, args):
         """ cd [DATABASE|TABLE|COLUMN|-]
@@ -1732,7 +1828,7 @@ class Mysqlsh:
         print("Debug mode " + ("enabled" if g_debug else "disabled"))
 
     def command_format(self, args):
-        """ format [name=command]
+        """ format [command [format]]
 
             Set default format or for a specific command
 
@@ -1762,6 +1858,19 @@ class Mysqlsh:
         else:
             print(f"format {self._default_format}")
 
+    def command_formats(self, args):
+        """ formats
+
+            Displays formats assigned to each command (unless default)
+        """
+        t = Table()
+        t.add("Command", "Format")
+
+        t.add("*default", self._default_format)
+        for command, form in self._format.items():
+            t.add(command, form)
+        t.print()
+
     def command_head(self, args):
         """ head TABLE [WHERE]
 
@@ -1771,7 +1880,6 @@ class Mysqlsh:
         p.add("-n", "--number", type=int, action="store")
         p.add("table", help="tables to dump", nargs="+", default=".")
 
-        print(self._format)
         args = p.parse()
 
         n = args.number
@@ -1785,7 +1893,7 @@ class Mysqlsh:
             level, (places) = self.place(table)
 
             if len(places) == 0:
-                raise KeyError(f"Not found: {place}")
+                raise KeyError(f"Not found: {table}")
 
             if level < 2:
                 raise KeyError("Cannot head directories")
@@ -1939,10 +2047,13 @@ class Mysqlsh:
 
             row = self.sql_get_one_row(f"SHOW CREATE TABLE `{db}`.`{table}`")
             table_defn = row[1].split("\n")
+            col_defn = None
             for line in table_defn:
                 line = line.lstrip()
                 if line.startswith(f"`{src}` "):
                     col_defn = f"`{dst}`" + line.rstrip(",")[len(src) + 2:]
+            if not col_defn:
+                raise KeyError(f"Column not found: {src}")
             query = f"ALTER TABLE `{db}`.`{table}` CHANGE COLUMN `{src}` {col_defn}"
 
         # Debug(tup)
@@ -2047,15 +2158,16 @@ class Mysqlsh:
                 if tables:
                     in_tables = "IN (" + ",".join(["'"+t+"'" for t in tables]) + ")"
                     rows = self.sql_get_rows(f"""
-                        SELECT TABLE_ROWS, ENGINE, UPDATE_TIME, TABLE_NAME
+                        SELECT TABLE_ROWS, ENGINE, CREATE_TIME, UPDATE_TIME, TABLE_TYPE, TABLE_NAME
                         FROM INFORMATION_SCHEMA.TABLES
                         WHERE TABLE_NAME {in_tables} AND TABLE_SCHEMA = "{dbname}"
                     """)
                     for row in rows:
-                        count = row[0]
-                        engine = row[1]
-                        date, time = str(row[2]).split() if row[2] else ("", "")
-                        tablename = row[3]
+                        count = "-" if row[0] is None else row[0]
+                        engine = row[1] or row[4]  # Show engine or 'VIEW"
+                        dt = row[3] if row[3] else row[2]
+                        date, time = str(dt).split() if dt else ("", "")
+                        tablename = row[5]
                         result.add(count, engine, date, time, tablename)
             elif level == 2:
                 result.add("Definition", "Key", f"Column in {dbname}.{tablename}")
@@ -2106,6 +2218,21 @@ class Mysqlsh:
         _, names = self.cmd_list(args)
         for name in names:
             print(name)
+
+    def command_pager(self, args):
+        """ pager [PROGRAM]
+        """
+        if len(args) == 1:
+            p = get_pager()
+            print(f"PAGER set to '{p or 'none'}'")
+            return
+
+        set_pager(" ".join(args[1:]))
+
+    def command_nopager(self, args):
+        """ nopager
+        """
+        set_pager(None)
 
     def command_ps(self, args):
         """ ps [full]
@@ -2201,20 +2328,35 @@ class Mysqlsh:
         """
         place = args[1] or ""
         level, parts = self.place(place)
+        t = Table()
+        if level == 1:
+            t.add("Tables", "Database")
+        elif level == 2:
+            t.add("Rows", "Columns", "Table")
         for part in parts:
             dbname, tablename, columnname = part
             if level == 0:
                 Debug(level, part)
             elif level == 1:
                 tables = self.sql_all_tables(dbname)
-                print(f"{len(tables):>6,} {dbname}")
+                t.add(len(tables), dbname)
             elif level == 2:
                 count = self.sql_count(tablename, dbname=dbname)
-                print(f"{count:>10,} {dbname}/{tablename}")
-                # columns = self.sql_all_columns(dbname, tablename)
-                # print(f"{len(columns):>6} {dbname}/{tablename}")
+                columns = self.sql_all_columns(dbname, tablename)
+                t.add(count, len(columns), f"{dbname}/{tablename}")
+                
             elif level == 3:
                 Debug(level, part)
+        t.print()
+
+    def display_result(self, cursor):
+        """ Display a result set in 'normal' format
+        """
+        rows = cursor.fetchall()
+
+        names = [i[0] for i in cursor.description]
+        render_it(names, rows)
+        return len(rows)
 
     def display_result_down(self, cursor):
         """ Display a result set in 'normal' format
@@ -2237,19 +2379,20 @@ class Mysqlsh:
     def read_command(self, line):
         cursor = self.cursor
 
-        if line.endswith("\\G"):
-            line = line[:-2]
-            down = True
-        else:
-            down = False
+        # if line.endswith("\\G"):
+        #     line = line[:-2]
+        #     down = True
+        # else:
+        #     down = False
         start = time.time()
         cursor.execute(line)
         elapsed = time.time() - start
 
-        if down:
-            count = self.display_result_down(cursor)
-        else:
-            count = self.display_result_across(cursor)
+        count = self.display_result(cursor)
+        # if down:
+        #     count = self.display_result_down(cursor)
+        # else:
+        #     count = self.display_result_across(cursor)
 
         prefix = f"{count} row{s(count)} in" if count else "Empty"
         print(f"{prefix} set ({elapsed:0.2f} sec)")
@@ -2270,16 +2413,41 @@ class Mysqlsh:
     def interpret(self, line):
         global _current_format
 
-        if line.lstrip().startswith("!"):
-            os.system(line.lstrip()[1:])
+        line = line.strip()
+        if line == "" or line.startswith("#"):
             return
 
-        if line.lstrip().startswith("?"):
+        if line.startswith("!"):
+            os.system(line[1:])
+            return
+
+        if line.startswith("?"):
             line = "help " + line[1:]
+
+        # See if we have a format prefix:
+        _format_prefix = None
+        words = line.split(None, 1)
+        word1 = words[0].lower()
+        if word1 in _formats or (word1.endswith("-") and word1[:-1] in _formats):
+            _format_prefix = word1
+            line = words[1]
+
+        # Now check for a suffix
+        _format_suffix = None
+        if line.endswith(";"):
+            _format_suffix = "table"
+            line = line[:-1].rstrip()
+        elif line.endswith(r"\G"):
+            _format_suffix = "list"
+            line = line[:-2].rstrip()
+
+        if not line or line.startswith("#"):
+            return
 
         expanding = set()
 
         words = shlex.split(line)
+        user_command = words[0].lower()
 
         # First alias substitution
         while True:
@@ -2295,30 +2463,6 @@ class Mysqlsh:
             expanding.add(self.command)
             words = shlex.split(alias) + words[1:]
 
-        # See if we have a format prefix:
-        _format_prefix = None
-        _format_suffix = None
-        if words:
-            word1 = words[0]
-            if word1.endswith("-"):
-                word1 = word1[:-1]
-            if word1 in _formats:
-                _format_prefix = words[0]
-                words.pop(0)
-
-        if words:
-            wordn = words[-1]
-            if wordn.endswith(";"):
-                _format_suffix = "table"
-                wordn = wordn[:-1]
-            elif wordn.endswith("\G"):
-                _format_suffix = "list"
-                wordn = wordn[:-2]
-            if wordn == "":
-                words.pop(-1)
-            else:
-                words[-1] = wordn
-
         # Var setting
         while words:
             m = re.match(r"(\w+)=(.*)", words[0])
@@ -2332,14 +2476,22 @@ class Mysqlsh:
 
         self.command = words[0]
         _current_format = (
-            self._format.get(self.command.lower()) 
-            or _format_prefix
+            _format_prefix
             or _format_suffix 
+            or self._format.get(user_command) 
             or self._default_format
         )
-        print(repr(words))
+
+        # Debug(self.command.lower())
+        # Debug(_format_prefix)
+        # Debug(_format_suffix)
+        # Debug(self._format.get(user_command)) 
+        # Debug(self._default_format)
+        # Debug(_current_format)
+
+        # print(repr(words))
         proc = "command_" + self.command.replace("-","_")
-        print(self.command, proc)
+        # print(self.command, proc)
         try:
             fn = self.__getattribute__(proc)
         except AttributeError:
